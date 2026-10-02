@@ -4,13 +4,15 @@ import Link from "next/link";
 import { Suspense, useCallback, useEffect, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { toast } from "sonner";
-import { Pause, Play, Plus, Search, Send, Trash2 } from "lucide-react";
+import { Check, Mail, Pause, Play, Plus, Search, Send, Trash2 } from "lucide-react";
 import { api, fmt, timeAgo } from "@/lib/client";
-import { Button, Card, Empty, Input, Label, Modal, PageHeader, Progress, Segmented, Spinner, StatusBadge } from "@/components/ui";
+import { Button, Card, Empty, Input, Label, Modal, PageHeader, Progress, Segmented, Spinner, StatusBadge, cn } from "@/components/ui";
+import { ChannelIcon, WhatsAppGlyph, type ChannelKind } from "@/components/Channel";
 
 type Row = {
   id: string;
   name: string;
+  channel: ChannelKind;
   status: string;
   createdAt: string;
   dailyLimit: number;
@@ -26,8 +28,10 @@ function CampaignsInner() {
   const [rows, setRows] = useState<Row[] | null>(null);
   const [filter, setFilter] = useState<"all" | "active" | "draft" | "paused" | "completed">("all");
   const [q, setQ] = useState("");
+  const [channelFilter, setChannelFilter] = useState<"all" | ChannelKind>("all");
   const [creating, setCreating] = useState(sp.get("new") === "1");
   const [name, setName] = useState("");
+  const [channel, setChannel] = useState<ChannelKind>(sp.get("channel") === "whatsapp" ? "whatsapp" : "email");
   const [busy, setBusy] = useState(false);
   const [deleting, setDeleting] = useState<Row | null>(null);
 
@@ -39,8 +43,8 @@ function CampaignsInner() {
   async function create() {
     setBusy(true);
     try {
-      const { campaign } = await api<{ campaign: { id: string } }>("/api/campaigns", { body: { name } });
-      router.push(`/campaigns/${campaign.id}?tab=leads`);
+      const { campaign } = await api<{ campaign: { id: string } }>("/api/campaigns", { body: { name, channel, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone } });
+      router.push(`/campaigns/${campaign.id}?tab=sheet`);
     } catch (e) {
       toast.error((e as Error).message);
       setBusy(false);
@@ -57,13 +61,18 @@ function CampaignsInner() {
     }
   }
 
-  const list = (rows || []).filter((r) => (filter === "all" || r.status === filter) && r.name.toLowerCase().includes(q.toLowerCase()));
+  const list = (rows || []).filter(
+    (r) =>
+      (filter === "all" || r.status === filter) &&
+      (channelFilter === "all" || r.channel === channelFilter) &&
+      r.name.toLowerCase().includes(q.toLowerCase()),
+  );
 
   return (
     <div className="animate-fade-up">
       <PageHeader
         title="Campaigns"
-        description="Personalized sequences sent from your Gmail inboxes."
+        description="Personalized email and WhatsApp sequences, sent at a human pace."
         actions={
           <Button icon={<Plus className="size-4" />} onClick={() => setCreating(true)}>
             New campaign
@@ -76,6 +85,15 @@ function CampaignsInner() {
           <Search className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-faint" />
           <Input placeholder="Search campaigns" value={q} onChange={(e) => setQ(e.target.value)} className="pl-9" />
         </div>
+        <Segmented
+          value={channelFilter}
+          onChange={setChannelFilter}
+          options={[
+            { value: "all", label: "All channels" },
+            { value: "email", label: <><Mail className="size-3.5" /> Email</> },
+            { value: "whatsapp", label: <><WhatsAppGlyph className="size-3.5" /> WhatsApp</> },
+          ]}
+        />
         <div className="max-w-full overflow-x-auto">
         <Segmented
           value={filter}
@@ -128,9 +146,16 @@ function CampaignsInner() {
                   return (
                     <tr key={r.id} className="cursor-pointer hover:bg-surface-2/50" onClick={() => router.push(`/campaigns/${r.id}`)}>
                       <td className="px-5 py-3.5">
-                        <div className="font-medium">{r.name}</div>
-                        <div className="mt-0.5 text-xs text-faint">
-                          {r.sheet?.title || "No sheet yet"} · {r.accountIds.length} inbox{r.accountIds.length === 1 ? "" : "es"} · {timeAgo(r.createdAt)}
+                        <div className="flex items-center gap-3">
+                          <ChannelIcon channel={r.channel} />
+                          <div className="min-w-0">
+                            <div className="truncate font-medium">{r.name}</div>
+                            <div className="mt-0.5 truncate text-xs text-faint">
+                              {r.sheet?.title || "No sheet yet"} · {r.accountIds.length}{" "}
+                              {r.channel === "whatsapp" ? `number${r.accountIds.length === 1 ? "" : "s"}` : `inbox${r.accountIds.length === 1 ? "" : "es"}`} ·{" "}
+                              {timeAgo(r.createdAt)}
+                            </div>
+                          </div>
                         </div>
                       </td>
                       <td className="px-3 py-3.5">
@@ -195,8 +220,47 @@ function CampaignsInner() {
           </>
         }
       >
+        <Label>Channel</Label>
+        <div className="mb-5 grid grid-cols-2 gap-3">
+          {(
+            [
+              { id: "email", title: "Email", text: "Gmail inboxes · subject lines, threads, open tracking" },
+              { id: "whatsapp", title: "WhatsApp", text: "Linked numbers · typing indicator, chat-style follow-ups" },
+            ] as const
+          ).map((o) => {
+            const on = channel === o.id;
+            return (
+              <button
+                key={o.id}
+                onClick={() => setChannel(o.id)}
+                className={cn(
+                  "relative rounded-xl border p-4 text-left transition",
+                  on
+                    ? o.id === "whatsapp"
+                      ? "border-wa bg-wa-soft/50 ring-3 ring-wa/15"
+                      : "border-primary bg-primary-soft/50 ring-3 ring-primary/15"
+                    : "border-border hover:border-border-strong",
+                )}
+              >
+                {on && (
+                  <span className={cn("absolute top-3 right-3 grid size-5 place-items-center rounded-full text-white", o.id === "whatsapp" ? "bg-wa" : "bg-primary")}>
+                    <Check className="size-3" />
+                  </span>
+                )}
+                <ChannelIcon channel={o.id} size="lg" />
+                <div className="mt-3 font-semibold">{o.title}</div>
+                <div className="mt-0.5 text-xs leading-relaxed text-muted">{o.text}</div>
+              </button>
+            );
+          })}
+        </div>
         <Label>Campaign name</Label>
-        <Input autoFocus placeholder="e.g. Agencies – October outreach" value={name} onChange={(e) => setName(e.target.value)} onKeyDown={(e) => e.key === "Enter" && create()} />
+        <Input
+          placeholder={channel === "whatsapp" ? "e.g. Restaurants – WhatsApp intro" : "e.g. Agencies – October outreach"}
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && create()}
+        />
       </Modal>
 
       <Modal

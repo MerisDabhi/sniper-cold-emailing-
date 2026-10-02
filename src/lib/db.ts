@@ -5,29 +5,25 @@ import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import type { AppEvent, DB, Lead } from "./types";
 
 /**
- * Supabase-backed store with two modes.
+ * Supabase-backed unit-of-work store.
  *
- * Long-running server (`npm run dev` / `npm start` on a VPS):
- *   one shared in-memory copy is loaded at startup; every change is written back to
- *   Supabase within ~0.5s. A background worker sends emails.
+ * Every API request, sender run and WhatsApp event runs inside `withStore(...)`, which loads
+ * a small private working set — owner, inboxes, WhatsApp numbers, campaigns, unsubscribes
+ * and the last 48h of sends — and lets the code fetch exactly the leads it needs with
+ * `fetchLeads()`. Lists and statistics are read with direct queries / the `lead_rollup`
+ * view instead of loading every lead.
  *
- * Serverless (Vercel, detected via the VERCEL env var):
- *   every request gets its own private copy (AsyncLocalStorage), loaded fresh from
- *   Supabase and saved before the response is returned — so concurrent requests on
- *   different instances never share stale state. The every-minute cron loads only
- *   the leads that are due ("cron" scope) to keep database traffic small.
- *
- * Only rows that actually changed are upserted, and only rows that were loaded can be
- * deleted. Duplicate-send guarantees don't depend on this layer at all (see dedupe.ts).
+ * When the unit of work ends, only the *fields* that changed are written back, so two
+ * processes touching the same lead at the same moment (e.g. a WhatsApp reply arriving while
+ * a follow-up is being sent) don't overwrite each other. A lead's final status (replied,
+ * unsubscribed, bounced, already contacted) is never replaced by a stale working status.
+ * Duplicate-send guarantees live in the database itself (see dedupe.ts).
  */
 
 export const SERVERLESS = !!process.env.VERCEL;
-const EVENT_WINDOW_MS = 45 * 86_400_000;
-const FLUSH_DELAY_MS = 500;
 
 type TableName = "owner" | "accounts" | "campaigns" | "leads" | "unsubscribes";
 type Row = Record<string, unknown>;
-export type Scope = "full" | "cron";
 
 const COLUMNS: Record<TableName, { key: string; cols: string[] }> = {
   owner: { key: "id", cols: ["id", "email", "name", "picture", "tokens", "connected_at"] },
@@ -38,20 +34,27 @@ const COLUMNS: Record<TableName, { key: string; cols: string[] }> = {
   campaigns: {
     key: "id",
     cols: [
-      "id", "name", "status", "sheet", "mapping", "steps", "schedule", "daily_limit", "account_ids", "stop_on_reply", "track_opens",
-      "unsubscribe_footer", "unsubscribe_text", "sheet_status", "sheet_status_column", "created_at", "launched_at", "last_synced_at",
+      "id", "name", "channel", "status", "sheet", "mapping", "steps", "schedule", "daily_limit", "account_ids", "stop_on_reply",
+      "track_opens", "unsubscribe_footer", "unsubscribe_text", "sheet_status", "sheet_status_column", "country_code", "created_at",
+      "launched_at", "last_synced_at",
     ],
   },
   leads: {
     key: "id",
     cols: [
-      "id", "campaign_id", "email", "data", "account_id", "status", "step_index", "next_at", "thread_id", "first_message_id",
-      "first_subject", "last_sent_at", "replied_at", "opened_at", "last_checked_at", "error", "token",
+      "id", "campaign_id", "email", "phone", "wa_jid", "data", "account_id", "status", "step_index", "next_at", "thread_id",
+      "first_message_id", "first_subject", "last_sent_at", "replied_at", "opened_at", "last_checked_at", "error", "token",
     ],
   },
   unsubscribes: { key: "email", cols: ["email", "at", "source"] },
 };
 const EVENT_COLS = ["id", "type", "at", "campaign_id", "account_id", "lead_id", "email", "step", "detail"];
+const WA_COLS = [
+  "id", "label", "phone", "name", "status", "paused", "qr", "error", "daily_limit", "next_send_at", "last_seen_at", "connected_at", "created_at",
+];
+
+/** Lead statuses that end a lead's sequence for good. */
+const FINAL_STATUSES = ["replied", "unsubscribed", "bounced", "duplicate"];
 
 const camel = (s: string) => s.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase());
 
@@ -68,21 +71,20 @@ function fromRow<T>(row: Row, cols: string[]): T {
 }
 
 export const leadFromRow = (row: Row) => fromRow<Lead>(row, COLUMNS.leads.cols);
+export const eventFromRow = (row: Row) => fromRow<AppEvent>(row, EVENT_COLS);
 export const LEAD_COLUMNS = COLUMNS.leads.cols.join(",");
+
+/** Snapshot of a row as loaded: column → JSON string, for field-level change detection. */
+type Snap = Map<string, Record<string, string>>;
+const snapOf = (row: Row) => Object.fromEntries(Object.entries(row).map(([k, v]) => [k, JSON.stringify(v)]));
 
 type Store = {
   data: DB;
-  loaded: boolean;
-  scope: Scope;
-  loading?: Promise<void>;
-  snap: Record<TableName, Map<string, string>>;
+  snap: Record<TableName, Snap>;
   eventQueue: AppEvent[];
-  timer: NodeJS.Timeout | null;
-  flushing: Promise<boolean> | null;
-  again: boolean;
 };
 
-const g = globalThis as unknown as { __sniperStore?: Store; __sniperSb?: SupabaseClient };
+const g = globalThis as unknown as { __sniperSb?: SupabaseClient };
 const als = new AsyncLocalStorage<Store>();
 
 export function sb(): SupabaseClient {
@@ -95,155 +97,107 @@ export function sb(): SupabaseClient {
   return g.__sniperSb;
 }
 
-function newStore(): Store {
-  return {
-    data: { owner: null, accounts: [], campaigns: [], leads: [], events: [], unsubscribes: [] },
-    loaded: false,
-    scope: "full",
-    snap: { owner: new Map(), accounts: new Map(), campaigns: new Map(), leads: new Map(), unsubscribes: new Map() },
-    eventQueue: [],
-    timer: null,
-    flushing: null,
-    again: false,
-  };
-}
-
 function store(): Store {
-  const scoped = als.getStore();
-  if (scoped) return scoped;
-  if (SERVERLESS) throw new Error("Database used outside of a request context");
-  if (!g.__sniperStore) g.__sniperStore = newStore();
-  return g.__sniperStore;
+  const s = als.getStore();
+  if (!s) throw new Error("Database used outside of withStore()");
+  return s;
 }
 
 // ─── Loading ───────────────────────────────────────────────────────────────
 
-type Query = ReturnType<ReturnType<SupabaseClient["from"]>["select"]>;
+export type Query = ReturnType<ReturnType<SupabaseClient["from"]>["select"]>;
 
 /** Fetch every matching row, 1000 at a time (PostgREST page limit). */
-async function fetchAll(table: string, build?: (q: Query) => Query): Promise<Row[]> {
+export async function fetchAll(table: string, build?: (q: Query) => Query, columns = "*"): Promise<Row[]> {
   const out: Row[] = [];
   for (let from = 0; ; from += 1000) {
-    let q = sb().from(table).select("*") as Query;
+    let q = sb().from(table).select(columns) as Query;
     if (build) q = build(q);
     const { data, error } = await q.range(from, from + 999);
     if (error) throw new Error(`Supabase: failed to load ${table}: ${error.message}`);
-    out.push(...(data as Row[]));
+    out.push(...((data || []) as unknown as Row[]));
     if (!data || data.length < 1000) return out;
   }
 }
 
-function install(s: Store, raw: Record<TableName, Row[]>, events: Row[], scope: Scope) {
-  for (const t of Object.keys(raw) as TableName[]) {
-    const { key, cols } = COLUMNS[t];
-    s.snap[t].clear();
-    for (const r of raw[t]) s.snap[t].set(String(r[key]), JSON.stringify(toRow(fromRow(r, cols), cols)));
-  }
+function track(s: Store, t: TableName, rows: Row[]) {
+  const { key, cols } = COLUMNS[t];
+  for (const r of rows) s.snap[t].set(String(r[key]), snapOf(toRow(fromRow(r, cols), cols)));
+}
+
+async function load(s: Store) {
+  const [owner, accounts, waAccounts, campaigns, unsubscribes, events] = await Promise.all([
+    fetchAll("owner"),
+    fetchAll("accounts"),
+    fetchAll("wa_accounts", (q) => q.order("created_at", { ascending: true })),
+    fetchAll("campaigns"),
+    fetchAll("unsubscribes"),
+    // Recent sends drive the daily quotas.
+    fetchAll("events", (q) => q.eq("type", "sent").gte("at", Date.now() - 2 * 86_400_000).order("at", { ascending: true })),
+  ]);
+  track(s, "owner", owner);
+  track(s, "accounts", accounts);
+  track(s, "campaigns", campaigns);
+  track(s, "unsubscribes", unsubscribes);
   s.data = {
-    owner: raw.owner[0] ? fromRow(raw.owner[0], COLUMNS.owner.cols) : null,
-    accounts: raw.accounts.map((r) => fromRow(r, COLUMNS.accounts.cols)),
-    campaigns: raw.campaigns.map((r) => fromRow(r, COLUMNS.campaigns.cols)),
-    leads: raw.leads.map((r) => fromRow(r, COLUMNS.leads.cols)),
-    unsubscribes: raw.unsubscribes.map((r) => fromRow(r, COLUMNS.unsubscribes.cols)),
+    owner: owner[0] ? fromRow(owner[0], COLUMNS.owner.cols) : null,
+    accounts: accounts.map((r) => fromRow(r, COLUMNS.accounts.cols)),
+    waAccounts: waAccounts.map((r) => fromRow(r, WA_COLS)),
+    campaigns: campaigns.map((r) => fromRow(r, COLUMNS.campaigns.cols)),
+    leads: [],
+    unsubscribes: unsubscribes.map((r) => fromRow(r, COLUMNS.unsubscribes.cols)),
     events: events.map((r) => fromRow(r, EVENT_COLS)),
   };
-  s.scope = scope;
-  s.loaded = true;
-}
-
-async function loadFull(s: Store) {
-  const [owner, accounts, campaigns, leads, unsubscribes, events] = await Promise.all([
-    fetchAll("owner"),
-    fetchAll("accounts"),
-    fetchAll("campaigns"),
-    fetchAll("leads", (q) => q.order("seq", { ascending: true })),
-    fetchAll("unsubscribes"),
-    fetchAll("events", (q) => q.gte("at", Date.now() - EVENT_WINDOW_MS).order("at", { ascending: true })),
-  ]);
-  install(s, { owner, accounts, campaigns, leads, unsubscribes }, events, "full");
 }
 
 /**
- * Minimal working set for one sender run: inboxes, campaigns, the next few due leads per
- * inbox, (optionally) leads whose threads need a reply check, and the last 48h of sends
- * for the daily quotas.
+ * Load leads matching a query into the current unit of work (tracked for saving).
+ * `all: true` pages through every match; otherwise the query's own limit applies.
+ * Leads already loaded are returned as the same objects.
  */
-async function loadCron(s: Store, withReplyCheck: boolean) {
-  const now = Date.now();
-  const [owner, accounts, campaigns, unsubscribes, events] = await Promise.all([
-    fetchAll("owner"),
-    fetchAll("accounts"),
-    fetchAll("campaigns"),
-    fetchAll("unsubscribes"),
-    fetchAll("events", (q) => q.eq("type", "sent").gte("at", now - 2 * 86_400_000).order("at", { ascending: true })),
-  ]);
-  const active = campaigns.filter((c) => c.status === "active").map((c) => c.id as string);
-  const leadMap = new Map<string, Row>();
-  const add = (rows: Row[] | null) => rows?.forEach((r) => leadMap.set(r.id as string, r));
-
-  await Promise.all(
-    accounts
-      .filter((a) => a.status === "active")
-      .map(async (a) => {
-        const jobs = [];
-        if (active.length) {
-          jobs.push(
-            sb().from("leads").select("*").eq("account_id", a.id).in("campaign_id", active).eq("status", "in_progress").lte("next_at", now).order("next_at").limit(3),
-            sb().from("leads").select("*").eq("account_id", a.id).in("campaign_id", active).eq("status", "pending").order("seq").limit(3),
-          );
-        }
-        if (withReplyCheck) {
-          jobs.push(
-            sb()
-              .from("leads")
-              .select("*")
-              .eq("account_id", a.id)
-              .in("status", ["in_progress", "completed"])
-              .not("thread_id", "is", null)
-              .is("replied_at", null)
-              .gt("last_sent_at", now - 45 * 86_400_000)
-              .order("last_checked_at", { ascending: true, nullsFirst: true })
-              .limit(10),
-          );
-        }
-        for (const r of await Promise.all(jobs)) {
-          if (r.error) throw new Error(`Supabase: failed to load leads: ${r.error.message}`);
-          add(r.data as Row[]);
-        }
-      }),
-  );
-  install(s, { owner, accounts, campaigns, leads: [...leadMap.values()], unsubscribes }, events, "cron");
-}
-
-/** Long-running mode: load the shared store once. (No-op inside a serverless request.) */
-export function ready(): Promise<void> {
+export async function fetchLeads(build: (q: Query) => Query, opts: { all?: boolean } = {}): Promise<Lead[]> {
   const s = store();
-  if (s.loaded) return Promise.resolve();
-  if (!s.loading) {
-    s.loading = loadFull(s).then(
-      () => console.log(`[db] loaded from Supabase: ${s.data.campaigns.length} campaigns, ${s.data.leads.length} leads, ${s.data.accounts.length} inboxes`),
-      (err) => {
-        s.loading = undefined;
-        throw err;
-      },
-    );
+  let rows: Row[];
+  if (opts.all) {
+    rows = await fetchAll("leads", (q) => build(q).order("seq", { ascending: true }));
+  } else {
+    const { data, error } = await build(sb().from("leads").select("*") as Query);
+    if (error) throw new Error(`Supabase: failed to load leads: ${error.message}`);
+    rows = (data || []) as unknown as Row[];
   }
-  return s.loading;
+  const byId = new Map(s.data.leads.map((l) => [l.id, l]));
+  const out: Lead[] = [];
+  for (const r of rows) {
+    const existing = byId.get(r.id as string);
+    if (existing) {
+      out.push(existing);
+      continue;
+    }
+    const lead = fromRow<Lead>(r, COLUMNS.leads.cols);
+    track(s, "leads", [r]);
+    s.data.leads.push(lead);
+    byId.set(lead.id, lead);
+    out.push(lead);
+  }
+  return out;
 }
 
-/**
- * Run `fn` with data loaded. Serverless: a private store for this request, saved to
- * Supabase before returning. Long-running: the shared store.
- */
-export async function withStore<T>(scope: Scope, fn: () => Promise<T>, opts: { replyCheck?: boolean } = {}): Promise<T> {
-  if (!SERVERLESS) {
-    await ready();
-    return fn();
-  }
-  const s = newStore();
+/** Read events (not tracked — events are append-only). */
+export async function fetchEvents(build: (q: Query) => Query): Promise<AppEvent[]> {
+  const rows = await fetchAll("events", build);
+  return rows.map((r) => fromRow<AppEvent>(r, EVENT_COLS));
+}
+
+/** Run `fn` with its own freshly loaded working set; changes are saved before it returns. */
+export async function withStore<T>(fn: () => Promise<T>): Promise<T> {
+  if (als.getStore()) return fn(); // already inside a unit of work
+  const s: Store = {
+    data: { owner: null, accounts: [], waAccounts: [], campaigns: [], leads: [], events: [], unsubscribes: [] },
+    snap: { owner: new Map(), accounts: new Map(), campaigns: new Map(), leads: new Map(), unsubscribes: new Map() },
+    eventQueue: [],
+  };
   return als.run(s, async () => {
-    if (scope === "full") await loadFull(s);
-    else await loadCron(s, !!opts.replyCheck);
+    await load(s);
     try {
       return await fn();
     } finally {
@@ -253,14 +207,7 @@ export async function withStore<T>(scope: Scope, fn: () => Promise<T>, opts: { r
 }
 
 export function db(): DB {
-  const s = store();
-  if (!s.loaded) throw new Error("Database not loaded yet");
-  return s.data;
-}
-
-/** True when only a partial set of leads is loaded (serverless sender run). */
-export function isPartial() {
-  return store().scope === "cron";
+  return store().data;
 }
 
 // ─── Saving ────────────────────────────────────────────────────────────────
@@ -270,86 +217,84 @@ function rowsOf(t: TableName, d: DB): Row[] {
   return d[t] as unknown as Row[];
 }
 
-async function writeChanges(s: Store) {
+/** Write the changes of the current unit of work to Supabase (field by field). */
+export async function persist() {
+  const s = store();
   const d = s.data;
   for (const t of ["owner", "accounts", "campaigns", "leads", "unsubscribes"] as TableName[]) {
     const { key, cols } = COLUMNS[t];
     const seen = new Set<string>();
-    const changed: { id: string; json: string; row: Row }[] = [];
+    const inserts: Row[] = [];
+    // Rows with identical changes are updated together: patch JSON → ids.
+    const groups = new Map<string, { patch: Row; ids: string[]; guardFinal: boolean }>();
+
     for (const obj of rowsOf(t, d)) {
       const row = toRow(obj, cols);
       const id = String(row[key]);
       seen.add(id);
-      const json = JSON.stringify(row);
-      if (s.snap[t].get(id) !== json) changed.push({ id, json, row });
+      const before = s.snap[t].get(id);
+      if (!before) {
+        inserts.push(row);
+        continue;
+      }
+      const patch: Row = {};
+      for (const c of cols) if (c !== key && before[c] !== JSON.stringify(row[c])) patch[c] = row[c];
+      if (!Object.keys(patch).length) continue;
+
+      // Never let a stale working status overwrite a final one written by someone else.
+      if (t === "leads" && "status" in patch && !FINAL_STATUSES.includes(String(patch.status))) {
+        const { status, ...rest } = patch;
+        if (Object.keys(rest).length) addGroup(groups, rest, id, false);
+        addGroup(groups, { status }, id, true);
+      } else {
+        addGroup(groups, patch, id, false);
+      }
+      s.snap[t].set(id, snapOf(row));
     }
-    for (let i = 0; i < changed.length; i += 500) {
-      const chunk = changed.slice(i, i + 500);
-      const { error } = await sb().from(t).upsert(chunk.map((c) => c.row), { onConflict: key });
-      if (error) throw new Error(`upsert ${t}: ${error.message}`);
-      for (const c of chunk) s.snap[t].set(c.id, c.json);
+
+    for (let i = 0; i < inserts.length; i += 500) {
+      const chunk = inserts.slice(i, i + 500);
+      const { error } = await sb().from(t).upsert(chunk, { onConflict: key });
+      if (error) throw new Error(`Could not save ${t}: ${error.message}`);
+      for (const r of chunk) s.snap[t].set(String(r[key]), snapOf(r));
+    }
+    for (const { patch, ids, guardFinal } of groups.values()) {
+      for (let i = 0; i < ids.length; i += 200) {
+        let q = sb().from(t).update(patch).in(key, ids.slice(i, i + 200));
+        if (guardFinal) q = q.not("status", "in", `(${FINAL_STATUSES.join(",")})`);
+        const { error } = await q;
+        if (error) throw new Error(`Could not save ${t}: ${error.message}`);
+      }
     }
     const removed = [...s.snap[t].keys()].filter((id) => !seen.has(id));
     for (let i = 0; i < removed.length; i += 200) {
       const chunk = removed.slice(i, i + 200);
       const { error } = await sb().from(t).delete().in(key, chunk);
-      if (error) throw new Error(`delete ${t}: ${error.message}`);
+      if (error) throw new Error(`Could not delete ${t}: ${error.message}`);
       for (const id of chunk) s.snap[t].delete(id);
     }
   }
   while (s.eventQueue.length) {
     const batch = s.eventQueue.splice(0, 1000);
-    const { error } = await sb().from("events").upsert(batch.map((e) => toRow(e as unknown as Row, EVENT_COLS)), { onConflict: "id", ignoreDuplicates: true });
+    const { error } = await sb()
+      .from("events")
+      .upsert(batch.map((e) => toRow(e as unknown as Row, EVENT_COLS)), { onConflict: "id", ignoreDuplicates: true });
     if (error) {
       s.eventQueue.unshift(...batch);
-      throw new Error(`insert events: ${error.message}`);
+      throw new Error(`Could not save events: ${error.message}`);
     }
   }
 }
 
-/** Write pending changes of a store. Returns false if Supabase rejected the write. */
-function flush(s: Store): Promise<boolean> {
-  if (s.timer) {
-    clearTimeout(s.timer);
-    s.timer = null;
-  }
-  if (s.flushing) {
-    s.again = true;
-    return s.flushing;
-  }
-  s.flushing = (async () => {
-    let ok = true;
-    try {
-      await writeChanges(s);
-    } catch (err) {
-      ok = false;
-      console.error("[db] Supabase write failed:", (err as Error).message);
-    } finally {
-      s.flushing = null;
-    }
-    if (!ok && !SERVERLESS) s.timer = setTimeout(() => flush(s), 5000);
-    else if (s.again) {
-      s.again = false;
-      return flush(s);
-    }
-    return ok;
-  })();
-  return s.flushing;
+function addGroup(groups: Map<string, { patch: Row; ids: string[]; guardFinal: boolean }>, patch: Row, id: string, guardFinal: boolean) {
+  const k = `${guardFinal ? "g" : "u"}:${JSON.stringify(patch)}`;
+  const grp = groups.get(k);
+  if (grp) grp.ids.push(id);
+  else groups.set(k, { patch, ids: [id], guardFinal });
 }
 
-/** Mark the store dirty; changes are written to Supabase within ~0.5s. */
-export function save() {
-  const s = store();
-  if (!s.timer && !s.flushing) s.timer = setTimeout(() => flush(s), FLUSH_DELAY_MS);
-  else if (s.flushing) s.again = true;
-}
-
-/** Write everything now and wait for it (used at the end of serverless requests). */
-export async function persist() {
-  const s = store();
-  while (s.flushing) await s.flushing;
-  if (!(await flush(s))) throw new Error("Could not save changes to the database");
-}
+/** Kept for readability at call sites: changes are saved when the unit of work ends. */
+export function save() {}
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
 
@@ -366,12 +311,6 @@ export function pushEvent(e: Omit<AppEvent, "id" | "at"> & { at?: number }) {
   const ev: AppEvent = { id: id("e_"), at: e.at ?? Date.now(), ...e };
   s.data.events.push(ev);
   s.eventQueue.push(ev);
-  const cutoff = Date.now() - EVENT_WINDOW_MS;
-  if (s.data.events.length > 1000 && s.data.events[0].at < cutoff) {
-    const keepFrom = s.data.events.findIndex((x) => x.at >= cutoff);
-    s.data.events.splice(0, keepFrom === -1 ? s.data.events.length : keepFrom);
-  }
-  save();
 }
 
 /** Strip OAuth tokens before sending accounts to the browser. */

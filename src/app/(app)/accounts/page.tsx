@@ -67,7 +67,7 @@ function AccountsInner() {
   return (
     <div className="animate-fade-up">
       <PageHeader
-        title="Email Accounts"
+        title="Email inboxes"
         description={
           accounts ? (
             <>

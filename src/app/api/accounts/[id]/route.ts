@@ -30,7 +30,7 @@ export const DELETE = handle(async (_req: NextRequest, { params }: Ctx) => {
   for (const c of d.campaigns) {
     if (!c.accountIds.includes(id)) continue;
     c.accountIds = c.accountIds.filter((x) => x !== id);
-    rebalanceLeads(c);
+    await rebalanceLeads(c);
   }
   save();
   return ok();

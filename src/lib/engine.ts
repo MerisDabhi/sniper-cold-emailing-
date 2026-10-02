@@ -1,10 +1,11 @@
 import "server-only";
-import { db, id, isPartial, pushEvent, save, sb, token } from "./db";
+import { db, fetchLeads, id, pushEvent, sb, token } from "./db";
 import { APP_URL, checkThread, errorMessage, getSheetRows, isAuthError, sendGmail } from "./google";
 import { EMAIL_RE, leadVariables, render, textToHtml } from "./template";
-import { alreadyContacted, claimContact, claimStep, normalizeEmail, recordStepMessage, releaseContact, releaseStep, syncClaimedLead } from "./dedupe";
-import { queueSheetStatus, stamp } from "./sheetSync";
-import type { Campaign, GmailAccount, Lead } from "./types";
+import { alreadyContacted, claimContact, claimStep, recordStepMessage, releaseContact, releaseStep, syncClaimedLead } from "./dedupe";
+import { leadMatch, queueSheetStatus, stamp } from "./sheetSync";
+import { contactKey, formatPhone, normalizePhone } from "./phone";
+import type { Campaign, Channel, GmailAccount, Lead } from "./types";
 
 const DAY = 86_400_000;
 export const IS_PUBLIC = !/localhost|127\.0\.0\.1|\[::1\]/.test(APP_URL);
@@ -35,11 +36,14 @@ export function dayKey(ts: number, tz: string) {
   return zoned(ts, tz).day;
 }
 
-const rand = (min: number, max: number) => min + Math.random() * Math.max(0, max - min);
+export const rand = (min: number, max: number) => min + Math.random() * Math.max(0, max - min);
+
+/** How a lead is shown in logs, events and the UI. */
+export const leadLabel = (lead: Pick<Lead, "email" | "phone">) => (lead.phone ? formatPhone(lead.phone) : lead.email || "");
 
 // ─── Quotas ────────────────────────────────────────────────────────────────
 
-/** Emails sent by an inbox in the last 24h (all campaigns) — the hard inbox cap. */
+/** Messages sent by an inbox / WhatsApp number in the last 24h (all campaigns) — the hard cap. */
 export function accountSentLast24h(accountId: string, now = Date.now()) {
   let n = 0;
   const ev = db().events;
@@ -47,7 +51,7 @@ export function accountSentLast24h(accountId: string, now = Date.now()) {
   return n;
 }
 
-/** Emails a campaign sent today (campaign timezone), optionally for one inbox. */
+/** Messages a campaign sent today (campaign timezone), optionally for one sender. */
 export function campaignSentToday(c: Campaign, accountId?: string, now = Date.now()) {
   const today = dayKey(now, c.schedule.timezone);
   let n = 0;
@@ -59,34 +63,52 @@ export function campaignSentToday(c: Campaign, accountId?: string, now = Date.no
   return n;
 }
 
-export function activeCampaignAccounts(c: Campaign) {
-  return db().accounts.filter((a) => c.accountIds.includes(a.id) && a.status === "active");
+/** Sender ids (Gmail inboxes or WhatsApp numbers) that exist for this campaign's channel. */
+export function senderIds(c: Campaign) {
+  const d = db();
+  const pool = c.channel === "whatsapp" ? d.waAccounts.map((a) => a.id) : d.accounts.map((a) => a.id);
+  return c.accountIds.filter((x) => pool.includes(x));
 }
 
-/** The daily campaign volume is split evenly over its inboxes: 200/day over 10 inboxes = 20 each. */
+export function activeSenderIds(c: Campaign) {
+  const d = db();
+  return c.channel === "whatsapp"
+    ? d.waAccounts.filter((a) => c.accountIds.includes(a.id) && a.status === "connected").map((a) => a.id)
+    : d.accounts.filter((a) => c.accountIds.includes(a.id) && a.status === "active").map((a) => a.id);
+}
+
+/** The daily campaign volume is split evenly over its senders: 200/day over 10 inboxes = 20 each. */
 export function perAccountQuota(c: Campaign) {
-  const n = Math.max(1, activeCampaignAccounts(c).length || c.accountIds.length);
+  const n = Math.max(1, activeSenderIds(c).length || c.accountIds.length);
   return Math.ceil(c.dailyLimit / n);
 }
 
 // ─── Lead import ───────────────────────────────────────────────────────────
 
 export async function syncLeads(c: Campaign) {
-  if (!c.sheet || !c.mapping?.email) throw new Error("Connect a sheet and map the email column first");
+  const wa = c.channel === "whatsapp";
+  const column = wa ? c.mapping?.phone : c.mapping?.email;
+  if (!c.sheet || !column) throw new Error(`Connect a sheet and map the ${wa ? "phone" : "email"} column first`);
   const d = db();
+  await fetchLeads((q) => q.eq("campaign_id", c.id), { all: true });
   const { headers, rows, rowNumbers } = await getSheetRows(c.sheet.spreadsheetId, c.sheet.tab);
   c.sheet.headers = headers;
 
-  const existing = new Set(d.leads.filter((l) => l.campaignId === c.id).map((l) => l.email));
-  // Addresses that already got a cold email from ANY campaign — never cold-email them twice.
-  const contacted = await alreadyContacted(rows.map((r) => r[c.mapping!.email] || "").filter((e) => EMAIL_RE.test(normalizeEmail(e))));
+  const normalize = (raw: string) => (wa ? normalizePhone(raw, c.countryCode) : EMAIL_RE.test(raw.trim().toLowerCase()) ? raw.trim().toLowerCase() : null);
+  const keyOf = (addr: string) => contactKey(wa ? { phone: addr } : { email: addr });
+
+  const existing = new Set(d.leads.filter((l) => l.campaignId === c.id).map((l) => (wa ? l.phone : l.email)));
+  const seen = new Set<string>();
+  // Contacts that already got a cold message from ANY campaign — never cold-contact them twice.
+  const addresses = rows.map((r) => normalize(r[column] || "")).filter((x): x is string => !!x);
+  const contacted = await alreadyContacted(addresses.map(keyOf));
   const campaignName = (cid: string) => d.campaigns.find((x) => x.id === cid)?.name || "another campaign";
   const unsub = new Set(d.unsubscribes.map((u) => u.email));
-  const accounts = c.accountIds.filter((aid) => d.accounts.some((a) => a.id === aid));
-  if (!accounts.length) throw new Error("Select at least one sending inbox");
+  const senders = senderIds(c);
+  if (!senders.length) throw new Error(wa ? "Select at least one WhatsApp number" : "Select at least one sending inbox");
 
-  // Balance new leads onto the inbox that currently has the fewest.
-  const load = new Map(accounts.map((a) => [a, 0]));
+  // Balance new leads onto the sender that currently has the fewest.
+  const load = new Map(senders.map((a) => [a, 0]));
   for (const l of d.leads) if (l.campaignId === c.id && load.has(l.accountId)) load.set(l.accountId, load.get(l.accountId)! + 1);
 
   let added = 0,
@@ -95,30 +117,31 @@ export async function syncLeads(c: Campaign) {
     alreadySent = 0;
   rows.forEach((row, i) => {
     const sheetRow = rowNumbers[i];
-    const email = normalizeEmail(row[c.mapping!.email] || "");
-    if (!EMAIL_RE.test(email)) {
+    const raw = (row[column] || "").trim();
+    const addr = normalize(raw);
+    if (!addr) {
       invalid++;
-      if (email) queueSheetStatus(c, { row: sheetRow }, "Skipped · invalid email");
+      if (raw) queueSheetStatus(c, { row: sheetRow }, wa ? "Skipped · invalid phone number" : "Skipped · invalid email");
       return;
     }
-    if (existing.has(email)) {
-      // Same address appears twice in the sheet (or was imported before) — only the first row is used.
+    if (seen.has(addr)) {
+      // The same contact appears again further down the sheet — only the first row is used.
       duplicate++;
-      if (!d.leads.some((l) => l.campaignId === c.id && l.email === email && l.stepIndex > 0)) {
-        queueSheetStatus(c, { row: sheetRow }, "Skipped · duplicate row");
-      }
+      queueSheetStatus(c, { row: sheetRow }, "Skipped · duplicate row");
       return;
     }
-    existing.add(email);
+    seen.add(addr);
+    if (existing.has(addr)) return; // imported by an earlier sync — leave its row and status alone
     const accountId = [...load.entries()].sort((a, b) => a[1] - b[1])[0][0];
     load.set(accountId, load.get(accountId)! + 1);
-    const prior = contacted.get(email);
-    const status = unsub.has(email) ? "unsubscribed" : prior ? "duplicate" : "pending";
+    const key = keyOf(addr);
+    const prior = contacted.get(key);
+    const status = unsub.has(key) ? "unsubscribed" : prior ? "duplicate" : "pending";
     d.leads.push({
       id: id("l_"),
       campaignId: c.id,
-      email,
-      data: leadVariables(row, c.mapping),
+      ...(wa ? { phone: addr } : { email: addr }),
+      data: { ...leadVariables(row, c.mapping), ...(wa ? { phone: formatPhone(addr) } : {}) },
       accountId,
       status,
       stepIndex: 0,
@@ -138,24 +161,182 @@ export async function syncLeads(c: Campaign) {
   });
   c.lastSyncedAt = new Date().toISOString();
   if (added > alreadySent && c.status === "completed") c.status = "active";
-  save();
   return { added, invalid, duplicate, alreadyContacted: alreadySent, total: rows.length };
 }
 
-/** Move unsent leads off an inbox that was removed from a campaign / deleted. */
-export function rebalanceLeads(c: Campaign) {
-  const d = db();
-  const valid = c.accountIds.filter((aid) => d.accounts.some((a) => a.id === aid));
+/** Move not-yet-contacted leads off a sender that was removed from a campaign / deleted. */
+export async function rebalanceLeads(c: Campaign) {
+  const valid = senderIds(c);
   if (!valid.length) return;
-  let i = 0;
-  for (const l of d.leads) {
-    if (l.campaignId !== c.id || valid.includes(l.accountId)) continue;
-    if (l.stepIndex === 0 && l.status === "pending") l.accountId = valid[i++ % valid.length];
-  }
-  save();
+  const orphans = await fetchLeads(
+    (q) => q.eq("campaign_id", c.id).eq("status", "pending").eq("step_index", 0).not("account_id", "in", `(${valid.join(",")})`),
+    { all: true },
+  );
+  orphans.forEach((l, i) => (l.accountId = valid[i % valid.length]));
 }
 
-// ─── Building an email ─────────────────────────────────────────────────────
+// ─── Shared sending pipeline ───────────────────────────────────────────────
+
+/** Pick the next lead a sender should message: due follow-ups first, then new leads in sheet order. */
+/** Campaigns a sender may send for right now: in their sending window and under today's quota. */
+export function eligibleCampaigns(accountId: string, campaigns: Campaign[], now: number) {
+  return campaigns.filter(
+    (c) => c.accountIds.includes(accountId) && inWindow(c, now) && campaignSentToday(c, accountId, now) < perAccountQuota(c),
+  );
+}
+
+export function pickLead(accountId: string, campaigns: Campaign[], now: number, skip = new Set<string>()): { c: Campaign; lead: Lead } | null {
+  const d = db();
+  const eligible = eligibleCampaigns(accountId, campaigns, now);
+  if (!eligible.length) return null;
+  const ids = new Set(eligible.map((c) => c.id));
+  let followUp: Lead | null = null;
+  let fresh: Lead | null = null;
+  for (const l of d.leads) {
+    if (l.accountId !== accountId || !ids.has(l.campaignId) || l.nextAt > now || skip.has(l.id)) continue;
+    if (l.status === "in_progress") {
+      if (!followUp || l.nextAt < followUp.nextAt) followUp = l;
+    } else if (l.status === "pending" && !fresh) fresh = l;
+  }
+  const lead = followUp || fresh;
+  return lead ? { c: eligible.find((c) => c.id === lead.campaignId)!, lead } : null;
+}
+
+/**
+ * Load the next few due leads for each sender into the current unit of work — only from the
+ * campaigns that sender may send for right now (window + quota), so a campaign that's outside
+ * its hours can never block the others.
+ */
+export async function loadDueLeads(channel: Channel, senderIdsToLoad: string[], now = Date.now()) {
+  const d = db();
+  const active = d.campaigns.filter((c) => c.status === "active" && c.channel === channel);
+  await Promise.all(
+    senderIdsToLoad.map((sid) => {
+      const ids = eligibleCampaigns(sid, active, now).map((c) => c.id);
+      if (!ids.length) return null;
+      return Promise.all([
+        fetchLeads((q) => q.eq("account_id", sid).in("campaign_id", ids).eq("status", "in_progress").lte("next_at", now).order("next_at").limit(5)),
+        fetchLeads((q) => q.eq("account_id", sid).in("campaign_id", ids).eq("status", "pending").order("seq").limit(5)),
+      ]);
+    }),
+  );
+}
+
+/** How many leads a sender may skip past (already contacted, unsubscribed…) in one run. */
+export const MAX_SKIPS_PER_RUN = 5;
+
+export type ClaimResult = "ok" | "skip";
+
+/**
+ * Pre-send checks shared by email and WhatsApp: unsubscribed, sequence finished, and the two
+ * duplicate guards (step claim + one-cold-message-per-contact). "ok" means it's safe to send.
+ */
+export async function prepareSend(c: Campaign, lead: Lead, accountId: string): Promise<ClaimResult> {
+  const d = db();
+  if (d.unsubscribes.some((u) => u.email === contactKey(lead))) {
+    lead.status = "unsubscribed";
+    return "skip";
+  }
+  if (!c.steps[lead.stepIndex]) {
+    lead.status = "completed";
+    return "skip";
+  }
+  const step = lead.stepIndex;
+  if (!(await claimStep(lead, step, accountId))) {
+    // This step was already claimed — never resend it. Find out what really happened.
+    if ((await syncClaimedLead(lead, step)) === "stale") advanceLead(c, lead); // crashed right after sending
+    return "skip";
+  }
+  if (step === 0) {
+    const claim = await claimContact(lead, accountId);
+    if (!claim.ok) {
+      await releaseStep(lead.id, step);
+      const other = d.campaigns.find((x) => x.id === claim.campaignId)?.name || "another campaign";
+      lead.status = "duplicate";
+      lead.error = `Already contacted in "${other}"`;
+      pushEvent({ type: "duplicate", campaignId: c.id, accountId, leadId: lead.id, email: leadLabel(lead), detail: lead.error });
+      queueSheetStatus(c, { match: leadMatch(lead) }, `Skipped · already contacted (${other})`);
+      return "skip";
+    }
+  }
+  return "ok";
+}
+
+/**
+ * Last check right before a message actually goes out: has the lead replied or unsubscribed
+ * in the meantime (e.g. while WhatsApp was showing "typing…")? Returns false if so.
+ */
+export async function stillSendable(lead: Lead): Promise<boolean> {
+  const { data, error } = await sb().from("leads").select("status, replied_at").eq("id", lead.id).maybeSingle();
+  if (error || !data) return true; // brand-new lead not saved yet, or a read hiccup: the claims still prevent duplicates
+  if (data.replied_at || !["pending", "in_progress"].includes(data.status)) {
+    lead.status = data.status;
+    if (data.replied_at) lead.repliedAt = Number(data.replied_at);
+    return false;
+  }
+  return true;
+}
+
+/** Thrown when a lead stopped being sendable during the send. */
+export class SendCancelled extends Error {}
+
+/** Undo the duplicate claims after the provider rejected a message, so it can be retried. */
+export async function releaseClaims(lead: Lead, step: number) {
+  await releaseStep(lead.id, step);
+  if (step === 0) await releaseContact(lead);
+}
+
+/** Record a successful send: advance the sequence, log it, update the sheet. */
+export function recordSent(c: Campaign, lead: Lead, accountId: string, from: string, detail: string, providerId?: string) {
+  const step = lead.stepIndex;
+  lead.lastSentAt = Date.now();
+  lead.error = undefined;
+  advanceLead(c, lead);
+  if (providerId) recordStepMessage(lead.id, step, providerId).catch(() => {});
+  pushEvent({ type: "sent", campaignId: c.id, accountId, leadId: lead.id, email: leadLabel(lead), step: step + 1, detail });
+  queueSheetStatus(
+    c,
+    { match: leadMatch(lead) },
+    lead.status === "completed"
+      ? `Sequence done · step ${step + 1}/${c.steps.length} sent ${stamp(c)} · from ${from}`
+      : `Sent · step ${step + 1}/${c.steps.length} · ${stamp(c)} · from ${from}`,
+  );
+  console.log(`[sniper] ${from} → ${leadLabel(lead)} (step ${step + 1}, "${c.name}")`);
+}
+
+/** Move a lead past the step it just received. */
+export function advanceLead(c: Campaign, lead: Lead) {
+  lead.stepIndex++;
+  if (lead.stepIndex >= c.steps.length) {
+    lead.status = "completed";
+  } else {
+    lead.status = "in_progress";
+    lead.nextAt = Date.now() + c.steps[lead.stepIndex].delayDays * DAY;
+  }
+}
+
+export async function finishCampaigns(channel: Channel) {
+  const d = db();
+  for (const c of d.campaigns) {
+    if (c.status !== "active" || c.channel !== channel) continue;
+    // Leads changed in this run aren't saved yet — count them from memory, the rest from the database.
+    const local = d.leads.filter((l) => l.campaignId === c.id);
+    if (local.some((l) => l.status === "pending" || l.status === "in_progress")) continue;
+    const [o, a] = await Promise.all([
+      sb()
+        .from("leads")
+        .select("id", { count: "exact", head: true })
+        .eq("campaign_id", c.id)
+        .in("status", ["pending", "in_progress"])
+        .not("id", "in", `(${local.map((l) => l.id).join(",") || "_"})`),
+      sb().from("leads").select("id", { count: "exact", head: true }).eq("campaign_id", c.id),
+    ]);
+    if (o.error || a.error) continue;
+    if ((o.count ?? 0) === 0 && (a.count ?? 0) > 0) c.status = "completed";
+  }
+}
+
+// ─── Email ─────────────────────────────────────────────────────────────────
 
 export function composeEmail(c: Campaign, lead: Lead, account: GmailAccount, stepIndex = lead.stepIndex) {
   const step = c.steps[stepIndex];
@@ -195,102 +376,47 @@ export function composeEmail(c: Campaign, lead: Lead, account: GmailAccount, ste
   };
 }
 
-// ─── Worker tick: at most one email per inbox per tick ─────────────────────
-
-function pickLead(account: GmailAccount, campaigns: Campaign[], now: number): { c: Campaign; lead: Lead } | null {
-  const d = db();
-  const eligible = campaigns.filter(
-    (c) => c.accountIds.includes(account.id) && inWindow(c, now) && campaignSentToday(c, account.id, now) < perAccountQuota(c),
-  );
-  if (!eligible.length) return null;
-  const ids = new Set(eligible.map((c) => c.id));
-  let followUp: Lead | null = null;
-  let fresh: Lead | null = null;
-  for (const l of d.leads) {
-    if (l.accountId !== account.id || !ids.has(l.campaignId) || l.nextAt > now) continue;
-    if (l.status === "in_progress") {
-      if (!followUp || l.nextAt < followUp.nextAt) followUp = l;
-    } else if (l.status === "pending" && !fresh) fresh = l;
-  }
-  // Follow-ups go first so sequences stay on time; new leads fill the rest.
-  const lead = followUp || fresh;
-  return lead ? { c: eligible.find((c) => c.id === lead.campaignId)!, lead } : null;
-}
-
-async function sendNext(account: GmailAccount, campaigns: Campaign[], now: number) {
-  const d = db();
-  const pick = pickLead(account, campaigns, now);
-  if (!pick) return;
-  const { c, lead } = pick;
-
-  if (d.unsubscribes.some((u) => u.email === lead.email)) {
-    lead.status = "unsubscribed";
-    save();
-    return;
-  }
-  if (!c.steps[lead.stepIndex]) {
-    lead.status = "completed";
-    save();
-    return;
-  }
-
-  const step = lead.stepIndex;
-
-  // ── Duplicate protection (enforced by unique keys in Supabase) ──
-  try {
-    if (!(await claimStep(lead, step, account.id))) {
-      // This step was already claimed — never resend it. Find out what really happened.
-      const outcome = await syncClaimedLead(lead, step);
-      if (outcome === "stale") advanceLead(c, lead); // crashed right after sending: move on
-      if (outcome !== "wait") save();
+async function sendNextEmail(account: GmailAccount, campaigns: Campaign[], now: number) {
+  // Leads that turn out to be unsendable (already contacted, unsubscribed…) are skipped and the
+  // next one is tried, so a run isn't wasted on them.
+  const tried = new Set<string>();
+  let pick: { c: Campaign; lead: Lead } | null = null;
+  for (let i = 0; i < MAX_SKIPS_PER_RUN; i++) {
+    const next = pickLead(account.id, campaigns, now, tried);
+    if (!next) return;
+    tried.add(next.lead.id);
+    try {
+      if ((await prepareSend(next.c, next.lead, account.id)) === "ok") {
+        pick = next;
+        break;
+      }
+    } catch (err) {
+      // Can't confirm with the database → don't risk a duplicate; try again shortly.
+      console.error(`[sniper] dedupe check failed, skipping this round: ${(err as Error).message}`);
+      account.nextSendAt = Date.now() + 60_000;
       return;
     }
-    if (step === 0) {
-      const claim = await claimContact(lead, account.id);
-      if (!claim.ok) {
-        await releaseStep(lead.id, step);
-        const other = d.campaigns.find((x) => x.id === claim.campaignId)?.name || "another campaign";
-        lead.status = "duplicate";
-        lead.error = `Already contacted in "${other}"`;
-        pushEvent({ type: "duplicate", campaignId: c.id, accountId: account.id, leadId: lead.id, email: lead.email, detail: lead.error });
-        queueSheetStatus(c, { email: lead.email }, `Skipped · already contacted (${other})`);
-        save();
-        return;
-      }
-    }
-  } catch (err) {
-    // Can't confirm with the database → don't risk a duplicate; try again shortly.
-    console.error(`[sniper] dedupe check failed, skipping this round: ${(err as Error).message}`);
-    account.nextSendAt = Date.now() + 60_000;
-    return;
   }
+  if (!pick) return;
+  const { c, lead } = pick;
+  const step = lead.stepIndex;
 
   const mail = composeEmail(c, lead, account);
   try {
-    const res = await sendGmail(account, { ...mail, fromName: account.name, fromEmail: account.email, to: lead.email });
+    if (!(await stillSendable(lead))) {
+      await releaseClaims(lead, step);
+      return;
+    }
+    const res = await sendGmail(account, { ...mail, fromName: account.name, fromEmail: account.email, to: lead.email! });
     if (step === 0) {
       lead.firstSubject = mail.subject;
       lead.firstMessageId = res.messageId;
     }
     lead.threadId = lead.threadId || res.threadId;
-    lead.lastSentAt = Date.now();
-    lead.error = undefined;
-    advanceLead(c, lead);
-    recordStepMessage(lead.id, step, res.id).catch(() => {});
-    pushEvent({ type: "sent", campaignId: c.id, accountId: account.id, leadId: lead.id, email: lead.email, step: step + 1, detail: mail.subject });
-    queueSheetStatus(
-      c,
-      { email: lead.email },
-      lead.status === "completed"
-        ? `Sequence done · step ${step + 1}/${c.steps.length} sent ${stamp(c)} · from ${account.email}`
-        : `Sent · step ${step + 1}/${c.steps.length} · ${stamp(c)} · from ${account.email}`,
-    );
+    recordSent(c, lead, account.id, account.email, mail.subject, res.id);
     account.nextSendAt = Date.now() + rand(c.schedule.minGapSec, c.schedule.maxGapSec) * 1000;
-    console.log(`[sniper] ${account.email} → ${lead.email} (step ${step + 1}, "${c.name}")`);
   } catch (err) {
-    // Gmail rejected it — release the claims so it can be retried later.
-    await releaseStep(lead.id, step);
-    if (step === 0) await releaseContact(lead.email, lead.id);
+    await releaseClaims(lead, step);
     const msg = errorMessage(err);
     if (isAuthError(err)) {
       account.status = "error";
@@ -302,63 +428,27 @@ async function sendNext(account: GmailAccount, campaigns: Campaign[], now: numbe
       lead.status = "failed";
       lead.error = msg;
       account.nextSendAt = Date.now() + 60_000;
-      queueSheetStatus(c, { email: lead.email }, `Failed · ${msg.slice(0, 120)}`);
+      queueSheetStatus(c, { match: leadMatch(lead) }, `Failed · ${msg.slice(0, 120)}`);
     }
-    pushEvent({ type: "error", campaignId: c.id, accountId: account.id, leadId: lead.id, email: lead.email, detail: msg });
+    pushEvent({ type: "error", campaignId: c.id, accountId: account.id, leadId: lead.id, email: leadLabel(lead), detail: msg });
     console.error(`[sniper] send failed ${account.email} → ${lead.email}: ${msg}`);
   }
-  save();
 }
 
-/** Move a lead past the step it just received. */
-function advanceLead(c: Campaign, lead: Lead) {
-  lead.stepIndex++;
-  if (lead.stepIndex >= c.steps.length) {
-    lead.status = "completed";
-  } else {
-    lead.status = "in_progress";
-    lead.nextAt = Date.now() + c.steps[lead.stepIndex].delayDays * DAY;
-  }
-}
-
-async function finishCampaigns() {
-  const d = db();
-  for (const c of d.campaigns) {
-    if (c.status !== "active") continue;
-    let open: boolean, any: boolean;
-    if (isPartial()) {
-      const [o, a] = await Promise.all([
-        sb().from("leads").select("id", { count: "exact", head: true }).eq("campaign_id", c.id).in("status", ["pending", "in_progress"]),
-        sb().from("leads").select("id", { count: "exact", head: true }).eq("campaign_id", c.id),
-      ]);
-      if (o.error || a.error) continue;
-      open = (o.count ?? 0) > 0;
-      any = (a.count ?? 0) > 0;
-    } else {
-      open = d.leads.some((l) => l.campaignId === c.id && (l.status === "pending" || l.status === "in_progress"));
-      any = d.leads.some((l) => l.campaignId === c.id);
-    }
-    if (!open && any) {
-      c.status = "completed";
-      save();
-    }
-  }
-}
-
+/** One email sender run: at most one email per inbox. Works in "base" or "full" scope. */
 export async function tick() {
   const d = db();
   const now = Date.now();
-  const campaigns = d.campaigns.filter((c) => c.status === "active");
+  const campaigns = d.campaigns.filter((c) => c.status === "active" && c.channel === "email");
   if (!campaigns.length) return;
-  const busy = d.accounts.filter(
-    (a) => a.status === "active" && a.nextSendAt <= now && accountSentLast24h(a.id, now) < a.dailyLimit,
-  );
+  const busy = d.accounts.filter((a) => a.status === "active" && a.nextSendAt <= now && accountSentLast24h(a.id, now) < a.dailyLimit);
+  await loadDueLeads("email", busy.map((a) => a.id), now);
   // Inboxes send in parallel, but each inbox only ever sends one email at a time.
-  await Promise.allSettled(busy.map((a) => sendNext(a, campaigns, now)));
-  await finishCampaigns();
+  await Promise.allSettled(busy.map((a) => sendNextEmail(a, campaigns, now)));
+  await finishCampaigns("email");
 }
 
-// ─── Reply / bounce detection ──────────────────────────────────────────────
+// ─── Email reply / bounce detection ────────────────────────────────────────
 
 export async function checkReplies(perAccount = 40) {
   const d = db();
@@ -368,17 +458,16 @@ export async function checkReplies(perAccount = 40) {
 
 async function checkAccountReplies(account: GmailAccount, perAccount: number, now: number) {
   const d = db();
-  const candidates = d.leads
-    .filter(
-      (l) =>
-        l.accountId === account.id &&
-        l.threadId &&
-        !l.repliedAt &&
-        (l.status === "in_progress" || l.status === "completed") &&
-        (l.lastSentAt || 0) > now - 45 * DAY,
-    )
-    .sort((a, b) => (a.lastCheckedAt || 0) - (b.lastCheckedAt || 0))
-    .slice(0, perAccount);
+  const candidates = await fetchLeads((q) =>
+    q
+      .eq("account_id", account.id)
+      .in("status", ["in_progress", "completed"])
+      .not("thread_id", "is", null)
+      .is("replied_at", null)
+      .gt("last_sent_at", now - 45 * DAY)
+      .order("last_checked_at", { ascending: true, nullsFirst: true })
+      .limit(perAccount),
+  );
 
   for (const lead of candidates) {
     try {
@@ -387,18 +476,10 @@ async function checkAccountReplies(account: GmailAccount, perAccount: number, no
       const c = d.campaigns.find((x) => x.id === lead.campaignId);
       if (r.bounced && !r.replied) {
         lead.status = "bounced";
-        pushEvent({ type: "bounce", campaignId: lead.campaignId, accountId: account.id, leadId: lead.id, email: lead.email });
-        if (c) queueSheetStatus(c, { email: lead.email }, `Bounced · ${stamp(c)}`);
+        pushEvent({ type: "bounce", campaignId: lead.campaignId, accountId: account.id, leadId: lead.id, email: leadLabel(lead) });
+        if (c) queueSheetStatus(c, { match: leadMatch(lead) }, `Bounced · ${stamp(c)}`);
       } else if (r.replied) {
-        lead.repliedAt = r.at || Date.now();
-        pushEvent({ type: "reply", campaignId: lead.campaignId, accountId: account.id, leadId: lead.id, email: lead.email, detail: r.snippet });
-        if (r.unsubscribe) {
-          lead.status = "unsubscribed";
-          await addUnsubscribe(lead.email, "reply", lead);
-        } else {
-          if (!c || c.stopOnReply) lead.status = "replied";
-          if (c) queueSheetStatus(c, { email: lead.email }, `Replied · ${stamp(c, lead.repliedAt)}`);
-        }
+        await recordReply(lead, account.id, r.at || Date.now(), r.snippet || "", r.unsubscribe);
       }
     } catch (err) {
       lead.lastCheckedAt = Date.now();
@@ -409,33 +490,49 @@ async function checkAccountReplies(account: GmailAccount, perAccount: number, no
       }
     }
   }
-  save();
 }
 
-export async function addUnsubscribe(email: string, source: string, lead?: Lead) {
+/** A lead replied (email or WhatsApp): stop the sequence or unsubscribe them. */
+export async function recordReply(lead: Lead, accountId: string, at: number, snippet: string, wantsOut: boolean) {
+  const c = db().campaigns.find((x) => x.id === lead.campaignId);
+  lead.repliedAt = at;
+  pushEvent({ type: "reply", campaignId: lead.campaignId, accountId, leadId: lead.id, email: leadLabel(lead), detail: snippet.slice(0, 300) });
+  if (wantsOut) {
+    lead.status = "unsubscribed";
+    await addUnsubscribe(contactKey(lead), "reply", lead);
+  } else {
+    if (!c || c.stopOnReply) lead.status = "replied";
+    if (c) queueSheetStatus(c, { match: leadMatch(lead) }, `Replied · ${stamp(c, at)}`);
+  }
+}
+
+/**
+ * Stop a contact everywhere. `key` is an email address or "wa:<digits>".
+ * Updates loaded leads in memory and all other leads directly in the database.
+ */
+export async function addUnsubscribe(key: string, source: string, lead?: Lead) {
   const d = db();
-  email = email.toLowerCase();
-  if (!d.unsubscribes.some((u) => u.email === email)) d.unsubscribes.push({ email, at: Date.now(), source });
-  // Stop this address in every campaign — in memory and directly in the database
-  // (on Vercel only some leads are loaded at a time).
+  key = key.toLowerCase();
+  if (!d.unsubscribes.some((u) => u.email === key)) d.unsubscribes.push({ email: key, at: Date.now(), source });
+  const isWa = key.startsWith("wa:");
+  const value = isWa ? key.slice(3) : key;
   const campaignIds = new Set<string>();
   for (const l of d.leads) {
-    if (l.email !== email) continue;
+    if ((isWa ? l.phone : l.email) !== value) continue;
     if (l.status === "pending" || l.status === "in_progress") l.status = "unsubscribed";
     campaignIds.add(l.campaignId);
   }
   const { data, error } = await sb()
     .from("leads")
     .update({ status: "unsubscribed" })
-    .eq("email", email)
+    .eq(isWa ? "phone" : "email", value)
     .in("status", ["pending", "in_progress"])
     .select("campaign_id");
   if (error) console.error("[sniper] unsubscribe update failed", error.message);
   data?.forEach((r) => campaignIds.add(r.campaign_id));
   for (const cid of campaignIds) {
     const c = d.campaigns.find((x) => x.id === cid);
-    if (c) queueSheetStatus(c, { email }, `Unsubscribed · ${stamp(c)}`);
+    if (c) queueSheetStatus(c, { match: value }, `Unsubscribed · ${stamp(c)}`);
   }
-  pushEvent({ type: "unsubscribe", campaignId: lead?.campaignId, accountId: lead?.accountId, leadId: lead?.id, email, detail: source });
-  save();
+  pushEvent({ type: "unsubscribe", campaignId: lead?.campaignId, accountId: lead?.accountId, leadId: lead?.id, email: isWa ? formatPhone(value) : value, detail: source });
 }

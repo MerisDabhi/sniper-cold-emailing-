@@ -35,7 +35,7 @@ export async function GET(req: NextRequest) {
 
     if (purpose === "owner") {
       if (!granted.includes("spreadsheets")) return back("/welcome", { error: "Please allow access to Google Sheets" });
-      await withData("full", async () => {
+      await withData(async () => {
         const d = db();
         const sameAccount = d.owner?.email === profile.email;
         d.owner = {
@@ -50,7 +50,7 @@ export async function GET(req: NextRequest) {
 
     if (!granted.includes("gmail.send")) return back("/accounts", { error: "Please tick the Gmail permission checkboxes on Google's screen" });
 
-    const outcome = await withData("full", async () => {
+    const outcome = await withData(async () => {
       const d = db();
       const existing = d.accounts.find((a) => a.email === profile.email);
       if (existing) {

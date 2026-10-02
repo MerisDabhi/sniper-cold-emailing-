@@ -10,6 +10,7 @@ import type { CampaignPatch, SheetInfo } from "./types";
 
 const GUESS: Record<keyof ColumnMapping, RegExp> = {
   email: /e-?mail/i,
+  phone: /(phone|mobile|whats ?app|cell|contact ?(no|number)|number)/i,
   firstName: /^(first|fname|first[\s_-]?name|given)/i,
   lastName: /^(last|lname|last[\s_-]?name|surname|family)/i,
   company: /(company|organi[sz]ation|business|brand|agency)/i,
@@ -21,11 +22,15 @@ export function guessMapping(headers: string[], current?: ColumnMapping): Column
     if (cur && headers.includes(cur)) return cur;
     return headers.find((h) => GUESS[k].test(h)) || "";
   };
-  return { email: find("email"), firstName: find("firstName"), lastName: find("lastName"), company: find("company") };
+  return { email: find("email"), phone: find("phone"), firstName: find("firstName"), lastName: find("lastName"), company: find("company") };
 }
 
+const contactField = (whatsapp: boolean): { key: keyof ColumnMapping; label: string; variable: string; required?: boolean } =>
+  whatsapp
+    ? { key: "phone", label: "WhatsApp / phone number", variable: "{{phone}}", required: true }
+    : { key: "email", label: "Email address", variable: "{{email}}", required: true };
+
 const FIELDS: { key: keyof ColumnMapping; label: string; variable: string; required?: boolean }[] = [
-  { key: "email", label: "Email address", variable: "{{email}}", required: true },
   { key: "firstName", label: "First name", variable: "{{first_name}}" },
   { key: "lastName", label: "Last name", variable: "{{last_name}}" },
   { key: "company", label: "Company name", variable: "{{company}}" },
@@ -103,7 +108,7 @@ export function SheetTab({ c, sheet, setSheet, onChange, locked }: { c: Campaign
         <Card>
           <CardHeader title="Map columns" description="Tell us which columns hold the basics. Every other column is also available as a variable." />
           <div className="grid gap-4 p-5 sm:grid-cols-2">
-            {FIELDS.map((f) => (
+            {[contactField(c.channel === "whatsapp"), ...FIELDS].map((f) => (
               <div key={f.key}>
                 <Label hint={f.variable}>
                   {f.label} {f.required && <span className="text-danger">*</span>}
@@ -118,6 +123,22 @@ export function SheetTab({ c, sheet, setSheet, onChange, locked }: { c: Campaign
                 </Select>
               </div>
             ))}
+            {c.channel === "whatsapp" && (
+              <div className="sm:col-span-2">
+                <Label hint="added to numbers in the sheet that don't start with + or a country code">Default country code</Label>
+                <div className="flex items-center gap-2">
+                  <span className="grid h-9 place-items-center rounded-lg border border-border-strong bg-surface-2 px-3 text-sm text-muted">+</span>
+                  <Input
+                    className="w-28"
+                    inputMode="numeric"
+                    placeholder="91"
+                    value={c.countryCode}
+                    onChange={(e) => onChange({ countryCode: e.target.value.replace(/\D/g, "").slice(0, 4) })}
+                  />
+                  <span className="text-xs text-faint">e.g. 91 India · 1 US/Canada · 44 UK · 971 UAE</span>
+                </div>
+              </div>
+            )}
           </div>
           {sheet && sheet.sample.length > 0 && (
             <div className="border-t border-border">

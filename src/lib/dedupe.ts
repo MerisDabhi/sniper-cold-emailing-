@@ -1,5 +1,6 @@
 import "server-only";
 import { LEAD_COLUMNS, leadFromRow, sb } from "./db";
+import { contactKey } from "./phone";
 import type { Lead } from "./types";
 
 /**
@@ -7,8 +8,9 @@ import type { Lead } from "./types";
  *
  *  - `sends (lead_id, step)`: a sequence step is claimed *before* Gmail is called, so the same
  *    step can never go to a lead twice — even after a crash, restart or a retry.
- *  - `contacts (email)`: the first cold email to an address claims it forever, so no other
- *    campaign or inbox can ever cold-email that person again.
+ *  - `contacts (email)`: the first cold message to a contact claims it forever, so no other
+ *    campaign, inbox or WhatsApp number can ever cold-contact that person again on that channel.
+ *    The key is the email address, or "wa:<digits>" for WhatsApp numbers.
  */
 
 export const normalizeEmail = (e: string) => e.trim().toLowerCase();
@@ -18,7 +20,7 @@ export async function claimStep(lead: Lead, step: number, accountId: string): Pr
   const { data, error } = await sb()
     .from("sends")
     .upsert(
-      { lead_id: lead.id, step, campaign_id: lead.campaignId, account_id: accountId, email: lead.email },
+      { lead_id: lead.id, step, campaign_id: lead.campaignId, account_id: accountId, email: contactKey(lead) },
       { onConflict: "lead_id,step", ignoreDuplicates: true },
     )
     .select("lead_id");
@@ -61,9 +63,9 @@ export async function recordStepMessage(leadId: string, step: number, gmailMessa
 
 export type ContactClaim = { ok: true } | { ok: false; campaignId: string; leadId: string };
 
-/** Claim the address for a first-touch cold email. Fails if anyone already cold-emailed it. */
+/** Claim the contact for a first-touch cold message. Fails if anyone already cold-contacted it. */
 export async function claimContact(lead: Lead, accountId: string): Promise<ContactClaim> {
-  const email = normalizeEmail(lead.email);
+  const email = contactKey(lead);
   const { data, error } = await sb()
     .from("contacts")
     .upsert({ email, lead_id: lead.id, campaign_id: lead.campaignId, account_id: accountId }, { onConflict: "email", ignoreDuplicates: true })
@@ -77,15 +79,15 @@ export async function claimContact(lead: Lead, accountId: string): Promise<Conta
   return { ok: false, campaignId: existing.campaign_id, leadId: existing.lead_id };
 }
 
-export async function releaseContact(email: string, leadId: string) {
-  const { error } = await sb().from("contacts").delete().eq("email", normalizeEmail(email)).eq("lead_id", leadId);
+export async function releaseContact(lead: Lead) {
+  const { error } = await sb().from("contacts").delete().eq("email", contactKey(lead)).eq("lead_id", lead.id);
   if (error) console.error("[dedupe] releaseContact failed", error.message);
 }
 
-/** Which of these addresses have already received a cold email (from any campaign)? */
-export async function alreadyContacted(emails: string[]): Promise<Map<string, string>> {
-  const out = new Map<string, string>(); // email -> campaign_id
-  const list = [...new Set(emails.map(normalizeEmail))];
+/** Which of these contact keys have already been cold-contacted (from any campaign)? */
+export async function alreadyContacted(keys: string[]): Promise<Map<string, string>> {
+  const out = new Map<string, string>(); // contact key -> campaign_id
+  const list = [...new Set(keys)];
   for (let i = 0; i < list.length; i += 200) {
     const { data, error } = await sb().from("contacts").select("email, campaign_id").in("email", list.slice(i, i + 200));
     if (error) throw new Error(`Supabase alreadyContacted: ${error.message}`);

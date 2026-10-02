@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useMemo } from "react";
 import { AlertTriangle, CheckCircle2, Clock, FileSpreadsheet, Inbox, Info, Plus, Timer } from "lucide-react";
 import type { Campaign } from "@/lib/types";
+import { WhatsAppGlyph } from "../Channel";
 import { Avatar, Badge, Button, Card, CardHeader, Empty, Input, Label, Select, Switch, Textarea, cn } from "../ui";
 import type { AccountLite, CampaignPatch } from "./types";
 
@@ -25,6 +26,10 @@ export function ScheduleTab({ c, onChange }: { c: Campaign; onChange: (p: Campai
   const set = (p: Partial<Campaign["schedule"]>) => onChange({ schedule: { ...s, ...p } });
   const tzs = useMemo(timezones, []);
   const inboxes = Math.max(1, c.accountIds.length);
+  const wa = c.channel === "whatsapp";
+  const msg = wa ? "message" : "email";
+  const sender = wa ? "number" : "inbox";
+  const senders = wa ? "numbers" : "inboxes";
   const perInbox = Math.ceil(c.dailyLimit / inboxes);
 
   // Simulate one inbox's day so the pacing is tangible.
@@ -51,7 +56,7 @@ export function ScheduleTab({ c, onChange }: { c: Campaign; onChange: (p: Campai
     <div className="grid gap-6 xl:grid-cols-[1fr_380px]">
       <div className="space-y-6">
         <Card>
-          <CardHeader title="Sending window" description="Emails only go out during these hours, in the chosen timezone." />
+          <CardHeader title="Sending window" description={`${wa ? "Messages" : "Emails"} only go out during these hours, in the chosen timezone.`} />
           <div className="space-y-5 p-5">
             <div>
               <Label>Days</Label>
@@ -107,10 +112,13 @@ export function ScheduleTab({ c, onChange }: { c: Campaign; onChange: (p: Campai
         </Card>
 
         <Card>
-          <CardHeader title="Volume & pacing" description="Behave like a person: one email at a time from each inbox, with a random pause in between." />
+          <CardHeader
+            title="Volume & pacing"
+            description={`Behave like a person: one ${msg} at a time from each ${sender}, with a random pause in between${wa ? " and a typing indicator before each message" : ""}.`}
+          />
           <div className="grid gap-5 p-5 sm:grid-cols-3">
             <div>
-              <Label hint="all inboxes">Emails per day</Label>
+              <Label hint={`all ${senders}`}>{wa ? "Messages" : "Emails"} per day</Label>
               <Input type="number" min={1} value={c.dailyLimit} onChange={(e) => onChange({ dailyLimit: Math.max(1, Number(e.target.value) || 1) })} />
             </div>
             <div>
@@ -125,29 +133,31 @@ export function ScheduleTab({ c, onChange }: { c: Campaign; onChange: (p: Campai
           <div className="mx-5 mb-5 flex items-start gap-2.5 rounded-lg bg-primary-soft/70 px-4 py-3 text-[13px]">
             <Info className="mt-0.5 size-4 shrink-0 text-primary" />
             <span className="text-muted">
-              <b className="text-text">{c.dailyLimit}</b> emails/day across <b className="text-text">{inboxes}</b> inbox{inboxes === 1 ? "" : "es"} ={" "}
-              <b className="text-text">{perInbox} per inbox</b>. Each inbox waits {Math.round(s.minGapSec / 60 * 10) / 10}–{Math.round(s.maxGapSec / 60 * 10) / 10} min between emails. Follow-ups
+              <b className="text-text">{c.dailyLimit}</b> {msg}s/day across <b className="text-text">{inboxes}</b> {inboxes === 1 ? sender : senders} ={" "}
+              <b className="text-text">{perInbox} per {sender}</b>. Each {sender} waits {Math.round(s.minGapSec / 60 * 10) / 10}–{Math.round(s.maxGapSec / 60 * 10) / 10} min between {msg}s. Follow-ups
               count toward the same daily total.
             </span>
           </div>
           {perInbox > capacityPerInbox && (
             <div className="mx-5 mb-5 flex items-start gap-2.5 rounded-lg bg-warning-soft px-4 py-3 text-[13px] text-warning">
               <AlertTriangle className="mt-0.5 size-4 shrink-0" />
-              With this window and gap, one inbox can only send ~{capacityPerInbox} emails/day. Widen the window, shorten the gap or add inboxes.
+              With this window and gap, one {sender} can only send ~{capacityPerInbox} {msg}s/day. Widen the window, shorten the gap or add {senders}.
             </div>
           )}
         </Card>
       </div>
 
       <Card className="h-fit">
-        <CardHeader title="A day in one inbox" description="Simulated send times" />
+        <CardHeader title={`A day in one ${sender}`} description="Simulated send times" />
         <div className="p-5">
           <ol className="relative space-y-0 border-l border-border pl-5">
             {sim.slice(0, 8).map((t, i) => (
               <li key={i} className="relative pb-4">
                 <span className="absolute top-1 -left-[25px] size-2.5 rounded-full border-2 border-surface bg-primary" />
                 <div className="flex items-center justify-between text-[13px]">
-                  <span className="font-medium">Email {i + 1}</span>
+                  <span className="font-medium">
+                    {wa ? "Message" : "Email"} {i + 1}
+                  </span>
                   <span className="text-muted tabular-nums">{fmtT(t)}</span>
                 </div>
                 {i > 0 && <div className="text-xs text-faint">+{Math.round((t - sim[i - 1]) / 6) / 10} min</div>}
@@ -171,6 +181,7 @@ export function InboxesTab({ c, accounts, onChange }: { c: Campaign; accounts: A
   const selected = new Set(c.accountIds);
   const chosen = accounts.filter((a) => selected.has(a.id));
   const perInbox = Math.ceil(c.dailyLimit / Math.max(1, chosen.filter((a) => a.status === "active").length || chosen.length));
+  const wa = c.channel === "whatsapp";
   const toggle = (id: string) => onChange({ accountIds: selected.has(id) ? c.accountIds.filter((x) => x !== id) : [...c.accountIds, id] });
   const allOn = accounts.length > 0 && accounts.every((a) => selected.has(a.id));
 
@@ -178,12 +189,12 @@ export function InboxesTab({ c, accounts, onChange }: { c: Campaign; accounts: A
     return (
       <Card>
         <Empty
-          icon={<Inbox className="size-5" />}
-          title="No inboxes connected"
-          description="Connect at least one Gmail account to send this campaign."
+          icon={wa ? <WhatsAppGlyph className="size-5 text-wa" /> : <Inbox className="size-5" />}
+          title={wa ? "No WhatsApp numbers linked" : "No inboxes connected"}
+          description={wa ? "Link at least one WhatsApp number by scanning a QR code." : "Connect at least one Gmail account to send this campaign."}
           action={
-            <Link href="/accounts">
-              <Button icon={<Plus className="size-4" />}>Add Gmail account</Button>
+            <Link href={wa ? "/whatsapp" : "/accounts"}>
+              <Button icon={<Plus className="size-4" />}>{wa ? "Link a WhatsApp number" : "Add Gmail account"}</Button>
             </Link>
           }
         />
@@ -193,8 +204,8 @@ export function InboxesTab({ c, accounts, onChange }: { c: Campaign; accounts: A
   return (
     <Card>
       <CardHeader
-        title="Sending inboxes"
-        description={`${chosen.length} selected · ${c.dailyLimit}/day split into ~${perInbox} per inbox. Leads are assigned evenly and every follow-up comes from the same inbox.`}
+        title={wa ? "Sending numbers" : "Sending inboxes"}
+        description={`${chosen.length} selected · ${c.dailyLimit}/day split into ~${perInbox} per ${wa ? "number" : "inbox"}. Leads are assigned evenly and every follow-up comes from the same ${wa ? "number, in the same chat" : "inbox"}.`}
         action={
           <Button variant="secondary" size="sm" onClick={() => onChange({ accountIds: allOn ? [] : accounts.map((a) => a.id) })}>
             {allOn ? "Deselect all" : "Select all"}
@@ -207,17 +218,30 @@ export function InboxesTab({ c, accounts, onChange }: { c: Campaign; accounts: A
           const over = on && perInbox > a.dailyLimit;
           return (
             <li key={a.id}>
-              <label className={cn("flex cursor-pointer items-center gap-3.5 px-5 py-3 transition", on ? "bg-primary-soft/30" : "hover:bg-surface-2/50")}>
-                <input type="checkbox" checked={on} onChange={() => toggle(a.id)} className="size-4 accent-[var(--primary)]" />
-                <Avatar src={a.picture} name={a.name} />
+              <label className={cn("flex cursor-pointer items-center gap-3.5 px-5 py-3 transition", on ? (wa ? "bg-wa-soft/30" : "bg-primary-soft/30") : "hover:bg-surface-2/50")}>
+                <input type="checkbox" checked={on} onChange={() => toggle(a.id)} className={cn("size-4", wa ? "accent-[var(--wa)]" : "accent-[var(--primary)]")} />
+                {wa ? (
+                  <span className="grid size-8 shrink-0 place-items-center rounded-full bg-wa-soft text-wa">
+                    <WhatsAppGlyph className="size-4" />
+                  </span>
+                ) : (
+                  <Avatar src={a.picture} name={a.name} />
+                )}
                 <div className="min-w-0 flex-1">
-                  <div className="truncate text-sm font-medium">{a.email}</div>
+                  <div className="truncate text-sm font-medium">
+                    {a.email}
+                    {wa && a.name && <span className="font-normal text-faint"> · {a.name}</span>}
+                  </div>
                   <div className="text-xs text-faint">
                     Limit {a.dailyLimit}/day · {a.sentToday} sent in last 24h
                   </div>
                 </div>
                 {over && <Badge tone="amber">Capped at {a.dailyLimit}/day</Badge>}
-                {a.status !== "active" ? <Badge tone={a.status === "error" ? "red" : "amber"}>{a.status}</Badge> : on && <CheckCircle2 className="size-4 text-primary" />}
+                {a.status !== "active" ? (
+                  <Badge tone={a.status === "error" ? "red" : "amber"}>{a.status === "error" ? (wa ? "not connected" : "error") : a.status}</Badge>
+                ) : (
+                  on && <CheckCircle2 className={cn("size-4", wa ? "text-wa" : "text-primary")} />
+                )}
               </label>
             </li>
           );
@@ -230,6 +254,7 @@ export function InboxesTab({ c, accounts, onChange }: { c: Campaign; accounts: A
 // ─── Options ───────────────────────────────────────────────────────────────
 
 export function OptionsTab({ c, onChange, isPublic, sheetWrite }: { c: Campaign; onChange: (p: CampaignPatch) => void; isPublic: boolean; sheetWrite: boolean }) {
+  const wa = c.channel === "whatsapp";
   return (
     <div className="max-w-3xl space-y-6">
       <Card>
@@ -266,6 +291,7 @@ export function OptionsTab({ c, onChange, isPublic, sheetWrite }: { c: Campaign;
           <Row title="Stop sequence on reply" text="When a lead replies, no further follow-ups are sent to them.">
             <Switch checked={c.stopOnReply} onChange={(v) => onChange({ stopOnReply: v })} />
           </Row>
+          {!wa && (
           <Row
             title="Track opens"
             text={
@@ -276,12 +302,22 @@ export function OptionsTab({ c, onChange, isPublic, sheetWrite }: { c: Campaign;
           >
             <Switch checked={c.trackOpens && isPublic} disabled={!isPublic} onChange={(v) => onChange({ trackOpens: v })} />
           </Row>
+          )}
         </div>
       </Card>
       <Card>
         <CardHeader title="Unsubscribe" description="A polite opt-out line keeps you compliant and protects your sender reputation." />
         <div className="divide-y divide-border">
-          <Row title="Add opt-out line" text={isPublic ? "Appended to every email together with a one-click unsubscribe link." : "Replies containing “unsubscribe” or “remove me” are detected automatically."}>
+          <Row
+            title="Add opt-out line"
+            text={
+              wa
+                ? "Added to the first message only. Replies like “STOP” or “not interested” are detected automatically either way."
+                : isPublic
+                  ? "Appended to every email together with a one-click unsubscribe link."
+                  : "Replies containing “unsubscribe” or “remove me” are detected automatically."
+            }
+          >
             <Switch checked={c.unsubscribeFooter} onChange={(v) => onChange({ unsubscribeFooter: v })} />
           </Row>
           {c.unsubscribeFooter && (
@@ -293,7 +329,10 @@ export function OptionsTab({ c, onChange, isPublic, sheetWrite }: { c: Campaign;
         </div>
       </Card>
       <div className="flex items-start gap-2.5 text-xs text-faint">
-        <Clock className="mt-px size-3.5 shrink-0" /> Replies, bounces and unsubscribes are checked in each inbox every 3 minutes.
+        <Clock className="mt-px size-3.5 shrink-0" />{" "}
+        {wa
+          ? "WhatsApp replies are picked up the moment they arrive. Numbers that aren't on WhatsApp are skipped and marked in your sheet."
+          : "Replies, bounces and unsubscribes are checked in each inbox every 3 minutes."}
       </div>
     </div>
   );

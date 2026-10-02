@@ -23,7 +23,8 @@ export default function LoginPage() {
     });
     if (res.ok) {
       const next = new URLSearchParams(window.location.search).get("next");
-      window.location.href = next && next.startsWith("/") && !next.startsWith("//") ? next : "/dashboard";
+      const safe = next && /^\/(?![/\\])/.test(next) && !next.includes("\\") ? next : "/dashboard";
+      window.location.href = safe;
       return;
     }
     const data = await res.json().catch(() => ({}));

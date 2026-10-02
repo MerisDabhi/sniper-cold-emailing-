@@ -4,6 +4,7 @@ import { Eye, MailX, Moon, Reply, Send, Undo2, Users } from "lucide-react";
 import { fmt, timeAgo } from "@/lib/client";
 import { ActivityChart, Legend, Stat } from "../Charts";
 import { ActivityFeed } from "../ActivityFeed";
+import { ChannelIcon } from "../Channel";
 import { Avatar, Badge, Card, CardHeader, Progress } from "../ui";
 import type { Detail } from "./types";
 
@@ -11,6 +12,7 @@ export function AnalyticsTab({ d }: { d: Detail }) {
   const s = d.stats;
   const c = d.campaign;
   const maxStep = Math.max(1, ...d.steps.map((x) => x.sent));
+  const wa = c.channel === "whatsapp";
   return (
     <div className="space-y-6">
       {c.status === "active" && !d.inWindow && (
@@ -22,8 +24,12 @@ export function AnalyticsTab({ d }: { d: Detail }) {
         <Stat label="Sent" value={fmt(s.sent)} sub={`${d.sentToday}/${c.dailyLimit} today`} icon={<Send className="size-3.5" />} />
         <Stat label="Contacted" value={fmt(s.contacted)} sub={`of ${fmt(s.leads)} leads`} icon={<Users className="size-3.5" />} tone="violet" />
         <Stat label="Replies" value={fmt(s.replied)} sub={`${s.replyRate}%`} icon={<Reply className="size-3.5" />} tone="success" />
-        <Stat label="Opens" value={fmt(s.opened)} sub={c.trackOpens ? `${s.openRate}%` : "tracking off"} icon={<Eye className="size-3.5" />} tone="violet" />
-        <Stat label="Bounced" value={fmt(s.bounced)} sub={`${s.bounceRate}%`} icon={<Undo2 className="size-3.5" />} tone="danger" />
+        {wa ? (
+          <Stat label="Queued" value={fmt(s.pending)} sub="waiting to be sent" icon={<Eye className="size-3.5" />} tone="violet" />
+        ) : (
+          <Stat label="Opens" value={fmt(s.opened)} sub={c.trackOpens ? `${s.openRate}%` : "tracking off"} icon={<Eye className="size-3.5" />} tone="violet" />
+        )}
+        <Stat label={wa ? "Not on WhatsApp" : "Bounced"} value={fmt(s.bounced)} sub={`${s.bounceRate}%`} icon={<Undo2 className="size-3.5" />} tone="danger" />
         <Stat label="Unsubscribed" value={fmt(s.unsubscribed)} sub={`${s.unsubRate}%`} icon={<MailX className="size-3.5" />} tone="warning" />
       </div>
 
@@ -64,11 +70,14 @@ export function AnalyticsTab({ d }: { d: Detail }) {
 
       <div className="grid gap-6 xl:grid-cols-2">
         <Card>
-          <CardHeader title="Inbox distribution" description={`Up to ${d.perAccountQuota} emails per inbox per day`} />
+          <CardHeader
+            title={wa ? "Number distribution" : "Inbox distribution"}
+            description={`Up to ${d.perAccountQuota} ${wa ? "messages per number" : "emails per inbox"} per day`}
+          />
           <ul className="divide-y divide-border">
             {d.senders.map((a) => (
               <li key={a.id} className="flex items-center gap-3 px-5 py-3">
-                <Avatar src={a.picture} name={a.name} size={28} />
+                {wa ? <ChannelIcon channel="whatsapp" size="sm" className="size-7 rounded-full" /> : <Avatar src={a.picture} name={a.name} size={28} />}
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-2">
                     <span className="truncate text-[13px] font-medium">{a.email}</span>
@@ -87,7 +96,7 @@ export function AnalyticsTab({ d }: { d: Detail }) {
                 </div>
               </li>
             ))}
-            {!d.senders.length && <li className="px-5 py-8 text-center text-sm text-faint">No inboxes selected.</li>}
+            {!d.senders.length && <li className="px-5 py-8 text-center text-sm text-faint">No {wa ? "numbers" : "inboxes"} selected.</li>}
           </ul>
         </Card>
         <Card>

@@ -125,15 +125,18 @@ export function columnLetter(index: number) {
 }
 
 /**
- * Write status text into one column of a sheet tab, locating rows by email.
+ * Write status text into one column of a sheet tab, locating rows by email or phone.
  * Creates the column header if it doesn't exist (and widens the grid if needed).
  */
 export async function writeSheetStatuses(opts: {
   spreadsheetId: string;
   tab: string;
-  emailHeader: string;
+  /** Column holding the email/phone used to find each lead's row */
+  matchHeader: string;
+  /** Normalizes a cell of that column the same way lead addresses are normalized */
+  normalize: (value: string) => string | null;
   statusHeader: string;
-  updates: { email?: string; row?: number; text: string }[];
+  updates: { match?: string; row?: number; text: string }[];
 }) {
   const sheets = google.sheets({ version: "v4", auth: ownerClient() });
   const tabRef = `'${opts.tab.replace(/'/g, "''")}'`;
@@ -141,7 +144,7 @@ export async function writeSheetStatuses(opts: {
   const values = (data.values || []) as string[][];
   const headers = (values[0] || []).map((h) => String(h || "").trim());
 
-  const emailIdx = headers.indexOf(opts.emailHeader);
+  const matchIdx = headers.indexOf(opts.matchHeader);
   let statusIdx = headers.findIndex((h) => h.toLowerCase() === opts.statusHeader.trim().toLowerCase());
   const writes: { range: string; values: string[][] }[] = [];
 
@@ -160,16 +163,16 @@ export async function writeSheetStatuses(opts: {
   }
 
   const rowOf = new Map<string, number>();
-  if (emailIdx !== -1) {
+  if (matchIdx !== -1) {
     values.slice(1).forEach((r, i) => {
-      const e = String(r[emailIdx] || "").trim().toLowerCase();
+      const e = opts.normalize(String(r[matchIdx] || ""));
       if (e && !rowOf.has(e)) rowOf.set(e, i + 2);
     });
   }
 
   const col = columnLetter(statusIdx);
   for (const u of opts.updates) {
-    const row = u.row ?? (u.email ? rowOf.get(u.email.toLowerCase()) : undefined);
+    const row = u.row ?? (u.match ? rowOf.get(u.match) : undefined);
     if (row) writes.push({ range: `${tabRef}!${col}${row}`, values: [[u.text]] });
   }
   if (!writes.length) return 0;
@@ -182,9 +185,14 @@ export async function writeSheetStatuses(opts: {
 
 // ─── Gmail ─────────────────────────────────────────────────────────────────
 
-function encodeHeader(v: string) {
+/** Encode a header value. Line breaks and control characters (e.g. from sheet data) are removed so they can't inject headers. */
+function encodeHeader(raw: string) {
+  const v = raw.replace(/[\x00-\x1f\x7f]+/g, " ").replace(/\s{2,}/g, " ").trim();
   return /^[\x20-\x7e]*$/.test(v) ? v : `=?UTF-8?B?${Buffer.from(v, "utf8").toString("base64")}?=`;
 }
+
+/** Single-line value for address headers (To/From): anything after a line break is dropped. */
+const oneLine = (v: string) => v.split(/[\r\n]/)[0].trim();
 
 function b64Lines(s: string) {
   return Buffer.from(s, "utf8").toString("base64").replace(/.{76}/g, "$&\r\n");
@@ -207,8 +215,8 @@ export async function sendGmail(account: GmailAccount, mail: OutgoingEmail) {
   const gmail = google.gmail({ version: "v1", auth: accountClient(account) });
   const boundary = "b_" + Math.random().toString(36).slice(2);
   const headers = [
-    `From: ${encodeHeader(mail.fromName)} <${mail.fromEmail}>`,
-    `To: ${mail.to}`,
+    `From: ${encodeHeader(mail.fromName)} <${oneLine(mail.fromEmail)}>`,
+    `To: ${oneLine(mail.to)}`,
     `Subject: ${encodeHeader(mail.subject)}`,
     "MIME-Version: 1.0",
     `Content-Type: multipart/alternative; boundary="${boundary}"`,
@@ -255,15 +263,32 @@ const UNSUB_RE = /\b(unsubscribe|remove me|stop emailing|take me off|not interes
 
 export async function checkThread(account: GmailAccount, threadId: string): Promise<ThreadCheck> {
   const gmail = google.gmail({ version: "v1", auth: accountClient(account) });
-  const { data } = await gmail.users.threads.get({ userId: "me", id: threadId, format: "metadata", metadataHeaders: ["From"] });
+  const { data } = await gmail.users.threads.get({
+    userId: "me",
+    id: threadId,
+    format: "metadata",
+    metadataHeaders: ["From", "Subject", "Auto-Submitted", "X-Autoreply", "X-Autorespond", "Precedence"],
+  });
   const result: ThreadCheck = { replied: false, bounced: false, unsubscribe: false };
   for (const m of data.messages || []) {
-    const from = (m.payload?.headers?.find((h) => h.name?.toLowerCase() === "from")?.value || "").toLowerCase();
+    const header = (name: string) => m.payload?.headers?.find((h) => h.name?.toLowerCase() === name.toLowerCase())?.value || "";
+    const from = header("From").toLowerCase();
     if (from.includes(account.email.toLowerCase())) continue;
     const at = Number(m.internalDate) || Date.now();
     if (/mailer-daemon|postmaster|mail delivery/.test(from)) {
       result.bounced = true;
       result.at = at;
+      continue;
+    }
+    // Out-of-office and other automatic replies are not real replies — keep the sequence going.
+    const auto = header("Auto-Submitted").toLowerCase();
+    if (
+      (auto && auto !== "no") ||
+      header("X-Autoreply") ||
+      header("X-Autorespond") ||
+      /^(auto_reply|bulk|junk)$/i.test(header("Precedence")) ||
+      /^(automatic reply|auto[- ]?reply|autoreply|out of (the )?office)/i.test(header("Subject"))
+    ) {
       continue;
     }
     result.replied = true;

@@ -6,6 +6,8 @@ import { useTheme } from "next-themes";
 import { AlertTriangle, CheckCircle2, Copy, FileSpreadsheet, LogOut, MailX, Monitor, Moon, Sun } from "lucide-react";
 import { toast } from "sonner";
 import { api, timeAgo } from "@/lib/client";
+import { displayContact } from "@/lib/phone";
+import { ChannelBadge } from "@/components/Channel";
 import { Avatar, Badge, Button, Card, CardHeader, Segmented } from "@/components/ui";
 
 type Me = {
@@ -122,13 +124,14 @@ export default function SettingsPage() {
       </Card>
 
       <Card>
-        <CardHeader title="Unsubscribed contacts" description="These addresses are never emailed again, in any campaign." action={<Badge>{me?.unsubscribes.length ?? 0}</Badge>} />
+        <CardHeader title="Unsubscribed contacts" description="These people are never contacted again, in any campaign." action={<Badge>{me?.unsubscribes.length ?? 0}</Badge>} />
         {me?.unsubscribes.length ? (
           <ul className="max-h-72 divide-y divide-border overflow-y-auto">
             {me.unsubscribes.map((u) => (
               <li key={u.email} className="flex items-center gap-3 px-5 py-2.5 text-[13px]">
                 <MailX className="size-4 text-warning" />
-                <span className="flex-1 truncate font-medium">{u.email}</span>
+                <span className="flex-1 truncate font-medium">{displayContact(u.email)}</span>
+                {u.email.startsWith("wa:") && <ChannelBadge channel="whatsapp" />}
                 <span className="text-faint">via {u.source}</span>
                 <span className="w-16 text-right text-faint">{timeAgo(u.at)}</span>
               </li>

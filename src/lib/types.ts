@@ -32,8 +32,33 @@ export type GmailAccount = {
   connectedAt: string;
 };
 
+export type Channel = "email" | "whatsapp";
+
+export type WaStatus = "pending" | "qr" | "connected" | "disconnected" | "logged_out" | "remove_requested";
+
+/** A WhatsApp number linked by QR code. Connection fields are owned by the WhatsApp worker. */
+export type WaAccount = {
+  id: string;
+  label: string;
+  phone?: string;
+  name?: string;
+  status: WaStatus;
+  /** User paused sending from this number (it stays connected) */
+  paused: boolean;
+  qr?: string;
+  error?: string;
+  dailyLimit: number;
+  nextSendAt: number;
+  lastSeenAt?: string;
+  connectedAt?: string;
+  createdAt: string;
+};
+
 export type ColumnMapping = {
-  email: string;
+  /** Required for email campaigns */
+  email?: string;
+  /** Required for WhatsApp campaigns */
+  phone?: string;
   firstName?: string;
   lastName?: string;
   company?: string;
@@ -64,6 +89,7 @@ export type CampaignSchedule = {
 export type Campaign = {
   id: string;
   name: string;
+  channel: Channel;
   status: CampaignStatus;
   sheet?: {
     spreadsheetId: string;
@@ -85,6 +111,8 @@ export type Campaign = {
   /** Write each lead's progress back into the Google Sheet */
   sheetStatus: boolean;
   sheetStatusColumn: string;
+  /** Country code added to sheet phone numbers without one, e.g. "91" (WhatsApp) */
+  countryCode: string;
   createdAt: string;
   launchedAt?: string;
   lastSyncedAt?: string;
@@ -98,13 +126,18 @@ export type LeadStatus =
   | "bounced"
   | "unsubscribed"
   | "failed"
-  /** Skipped: this address was already cold-emailed (by any campaign) */
+  /** Skipped: this person was already cold-contacted (by any campaign on the same channel) */
   | "duplicate";
 
 export type Lead = {
   id: string;
   campaignId: string;
-  email: string;
+  /** Email campaigns */
+  email?: string;
+  /** WhatsApp campaigns: full international number, digits only (e.g. 919876543210) */
+  phone?: string;
+  /** WhatsApp chat id the first message went to (used to match replies) */
+  waJid?: string;
   data: Record<string, string>;
   accountId: string;
   status: LeadStatus;
@@ -131,6 +164,7 @@ export type AppEvent = {
   campaignId?: string;
   accountId?: string;
   leadId?: string;
+  /** Email address or +phone of the lead, for display */
   email?: string;
   step?: number;
   detail?: string;
@@ -139,8 +173,11 @@ export type AppEvent = {
 export type DB = {
   owner: Owner | null;
   accounts: GmailAccount[];
+  /** Read-only snapshot; changed only via direct updates (see whatsapp/store.ts) */
+  waAccounts: WaAccount[];
   campaigns: Campaign[];
   leads: Lead[];
   events: AppEvent[];
+  /** `email` holds the contact key: an email address, or "wa:<digits>" for WhatsApp */
   unsubscribes: { email: string; at: number; source: string }[];
 };

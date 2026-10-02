@@ -21,6 +21,10 @@
   --danger: #e5484d;
   --danger-soft: #fdecec;
   --violet: #8b5cf6;
+  --wa: #14a44d;
+  --wa-soft: #e6f6ec;
+  --wa-chat: #efeae2;
+  --wa-bubble: #d9fdd3;
   --shadow: 0 1px 2px rgba(16, 24, 40, 0.04), 0 1px 3px rgba(16, 24, 40, 0.06);
   --shadow-lg: 0 12px 32px -8px rgba(16, 24, 40, 0.18);
 }
@@ -44,6 +48,10 @@
   --danger: #f2555a;
   --danger-soft: #2e1416;
   --violet: #a78bfa;
+  --wa: #25d366;
+  --wa-soft: #0f2a1b;
+  --wa-chat: #0b141a;
+  --wa-bubble: #005c4b;
   --shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
   --shadow-lg: 0 16px 40px -8px rgba(0, 0, 0, 0.6);
 }
@@ -67,6 +75,10 @@
   --color-danger: var(--danger);
   --color-danger-soft: var(--danger-soft);
   --color-violet: var(--violet);
+  --color-wa: var(--wa);
+  --color-wa-soft: var(--wa-soft);
+  --color-wa-chat: var(--wa-chat);
+  --color-wa-bubble: var(--wa-bubble);
   --shadow-card: var(--shadow);
   --shadow-pop: var(--shadow-lg);
   --font-sans: var(--font-inter), ui-sans-serif, system-ui, sans-serif;
@@ -144,4 +156,34 @@ select {
 .recharts-text {
   fill: var(--faint);
   font-size: 11px;
+}
+
+/* WhatsApp typing indicator */
+@keyframes typing-dot {
+  0%,
+  60%,
+  100% {
+    transform: translateY(0);
+    opacity: 0.4;
+  }
+  30% {
+    transform: translateY(-3px);
+    opacity: 1;
+  }
+}
+.typing-dot {
+  animation: typing-dot 1.2s ease-in-out infinite;
+}
+
+/* Subtle animated sheen for "live" elements */
+@keyframes ring-pulse {
+  0% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--wa) 45%, transparent);
+  }
+  100% {
+    box-shadow: 0 0 0 10px transparent;
+  }
+}
+.ring-pulse {
+  animation: ring-pulse 1.6s ease-out infinite;
 }

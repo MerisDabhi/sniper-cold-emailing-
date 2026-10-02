@@ -4,15 +4,23 @@ import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useTheme } from "next-themes";
 import { useEffect, useState } from "react";
-import { BarChart3, ChevronsUpDown, Inbox, LogOut, Menu, Monitor, Moon, Send, Settings, Sun, X } from "lucide-react";
+import { BarChart3, ChevronsUpDown, LogOut, Mail, Menu, Monitor, Moon, Send, Settings, Sun, X } from "lucide-react";
 import { api } from "@/lib/client";
 import { Avatar, cn } from "./ui";
+import { WhatsAppGlyph } from "./Channel";
 
-const NAV = [
-  { href: "/dashboard", label: "Analytics", icon: BarChart3 },
-  { href: "/campaigns", label: "Campaigns", icon: Send },
-  { href: "/accounts", label: "Email Accounts", icon: Inbox },
-  { href: "/settings", label: "Settings", icon: Settings },
+type NavItem = { href: string; label: string; icon: React.ComponentType<{ className?: string }>; tone?: "wa" };
+const NAV: { title?: string; items: NavItem[] }[] = [
+  { items: [{ href: "/dashboard", label: "Analytics", icon: BarChart3 }] },
+  { title: "Outreach", items: [{ href: "/campaigns", label: "Campaigns", icon: Send }] },
+  {
+    title: "Senders",
+    items: [
+      { href: "/accounts", label: "Email inboxes", icon: Mail },
+      { href: "/whatsapp", label: "WhatsApp numbers", icon: WhatsAppGlyph, tone: "wa" },
+    ],
+  },
+  { items: [{ href: "/settings", label: "Settings", icon: Settings }] },
 ];
 
 type Me = { owner: { email: string; name: string; picture?: string } | null };
@@ -84,23 +92,29 @@ export function Shell({ children }: { children: React.ReactNode }) {
           <X className="size-5" />
         </button>
       </div>
-      <nav className="mt-2 flex-1 space-y-0.5 px-3">
-        {NAV.map(({ href, label, icon: Icon }) => {
-          const active = pathname === href || pathname.startsWith(href + "/");
-          return (
-            <Link
-              key={href}
-              href={href}
-              className={cn(
-                "group flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition-colors",
-                active ? "bg-primary-soft text-primary" : "text-muted hover:bg-surface-2 hover:text-text",
-              )}
-            >
-              <Icon className={cn("size-[18px]", active ? "text-primary" : "text-faint group-hover:text-text")} />
-              {label}
-            </Link>
-          );
-        })}
+      <nav className="mt-2 flex-1 space-y-4 overflow-y-auto px-3">
+        {NAV.map((group, gi) => (
+          <div key={gi} className="space-y-0.5">
+            {group.title && <div className="px-3 pb-1 text-[11px] font-semibold tracking-wider text-faint uppercase">{group.title}</div>}
+            {group.items.map(({ href, label, icon: Icon, tone }) => {
+              const active = pathname === href || pathname.startsWith(href + "/");
+              const wa = tone === "wa";
+              return (
+                <Link
+                  key={href}
+                  href={href}
+                  className={cn(
+                    "group flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition-colors",
+                    active ? (wa ? "bg-wa-soft text-wa" : "bg-primary-soft text-primary") : "text-muted hover:bg-surface-2 hover:text-text",
+                  )}
+                >
+                  <Icon className={cn("size-[18px]", active ? (wa ? "text-wa" : "text-primary") : "text-faint group-hover:text-text")} />
+                  {label}
+                </Link>
+              );
+            })}
+          </div>
+        ))}
       </nav>
       <div className="space-y-3 border-t border-border p-3">
         <ThemeToggle />

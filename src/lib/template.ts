@@ -14,7 +14,8 @@ export function leadVariables(row: Record<string, string>, mapping?: ColumnMappi
   const vars: Record<string, string> = {};
   for (const [k, v] of Object.entries(row)) vars[slug(k)] = v ?? "";
   if (mapping) {
-    vars.email = row[mapping.email] ?? "";
+    if (mapping.email) vars.email = row[mapping.email] ?? "";
+    if (mapping.phone) vars.phone = row[mapping.phone] ?? "";
     if (mapping.firstName) vars.first_name = row[mapping.firstName] ?? "";
     if (mapping.lastName) vars.last_name = row[mapping.lastName] ?? "";
     if (mapping.company) vars.company = row[mapping.company] ?? "";
@@ -24,7 +25,7 @@ export function leadVariables(row: Record<string, string>, mapping?: ColumnMappi
 }
 
 export function variableKeys(headers: string[]): string[] {
-  const keys = new Set(["first_name", "last_name", "company", "email"]);
+  const keys = new Set(["first_name", "last_name", "company"]);
   headers.forEach((h) => keys.add(slug(h)));
   return [...keys].filter(Boolean);
 }

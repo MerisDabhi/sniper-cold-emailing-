@@ -4,6 +4,7 @@ import Link from "next/link";
 import { Suspense, use, useCallback, useEffect, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { toast } from "sonner";
+import { ChannelBadge } from "@/components/Channel";
 import { ArrowLeft, ArrowRight, Check, CheckCircle2, Cloud, FlaskConical, Loader2, Pause, Play, Rocket } from "lucide-react";
 import { api, pollWhileVisible } from "@/lib/client";
 import type { Campaign } from "@/lib/types";
@@ -20,16 +21,16 @@ const SETUP: { id: Tab; label: string }[] = [
   { id: "sheet", label: "Sheet & mapping" },
   { id: "sequence", label: "Sequence" },
   { id: "schedule", label: "Schedule" },
-  { id: "inboxes", label: "Inboxes" },
+  { id: "inboxes", label: "Senders" },
   { id: "options", label: "Options" },
 ];
 
 function complete(c: Campaign, tab: Tab) {
   switch (tab) {
     case "sheet":
-      return !!c.sheet && !!c.mapping?.email;
+      return !!c.sheet && !!(c.channel === "whatsapp" ? c.mapping?.phone : c.mapping?.email);
     case "sequence":
-      return !!c.steps[0]?.subject.trim() && c.steps.every((s) => s.body.trim());
+      return (c.channel === "whatsapp" || !!c.steps[0]?.subject.trim()) && c.steps.every((s) => s.body.trim());
     case "schedule":
       return c.schedule.days.length > 0 && c.schedule.endHour > c.schedule.startHour;
     case "inboxes":
@@ -58,7 +59,7 @@ function CampaignInner({ id }: { id: string }) {
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const loadDetail = useCallback(async () => {
-    const d = await api<Detail>(`/api/campaigns/${id}`);
+    const d = await api<Detail>(`/api/campaigns/${id}?tz=${encodeURIComponent(Intl.DateTimeFormat().resolvedOptions().timeZone)}`);
     setDetail(d);
     return d;
   }, [id]);
@@ -66,13 +67,12 @@ function CampaignInner({ id }: { id: string }) {
   useEffect(() => {
     (async () => {
       try {
-        const [d, acc, me] = await Promise.all([
+        const [d, me] = await Promise.all([
           loadDetail(),
-          api<{ accounts: AccountLite[] }>("/api/accounts"),
           api<{ isPublic: boolean; sheetWrite: boolean; owner: { email: string } | null }>("/api/me"),
         ]);
         setC(d.campaign);
-        setAccounts(acc.accounts);
+        setAccounts(await loadSenders(d.campaign.channel));
         setIsPublic(me.isPublic);
         setSheetWrite(me.sheetWrite);
         setOwnerEmail(me.owner?.email || "");
@@ -169,6 +169,7 @@ function CampaignInner({ id }: { id: string }) {
           onChange={(e) => onChange({ name: e.target.value })}
           className="min-w-0 flex-1 rounded-md bg-transparent px-1 -mx-1 text-[22px] font-semibold tracking-tight outline-none hover:bg-surface-2 focus:bg-surface-2"
         />
+        <ChannelBadge channel={c.channel} />
         <StatusBadge status={c.status} />
         <span className="flex w-16 items-center gap-1 text-xs text-faint">
           {saveState === "saving" ? (
@@ -273,8 +274,12 @@ function CampaignInner({ id }: { id: string }) {
             `${c.steps.length}-step sequence, stops when a lead replies${c.stopOnReply ? "" : " (disabled)"}`,
             "Anyone already cold-emailed by any campaign is skipped automatically",
             c.sheetStatus ? `Progress is written to the “${c.sheetStatusColumn}” column of your sheet` : "Sheet status updates are off",
-            `${c.dailyLimit} emails/day across ${c.accountIds.length} inbox${c.accountIds.length === 1 ? "" : "es"} (~${perInbox} each)`,
-            `One email at a time per inbox, ${Math.round(c.schedule.minGapSec / 60 * 10) / 10}–${Math.round(c.schedule.maxGapSec / 60 * 10) / 10} min apart`,
+            c.channel === "whatsapp"
+              ? `${c.dailyLimit} messages/day across ${c.accountIds.length} number${c.accountIds.length === 1 ? "" : "s"} (~${perInbox} each)`
+              : `${c.dailyLimit} emails/day across ${c.accountIds.length} inbox${c.accountIds.length === 1 ? "" : "es"} (~${perInbox} each)`,
+            c.channel === "whatsapp"
+              ? `One message at a time per number with a typing indicator, ${Math.round((c.schedule.minGapSec / 60) * 10) / 10}–${Math.round((c.schedule.maxGapSec / 60) * 10) / 10} min apart`
+              : `One email at a time per inbox, ${Math.round((c.schedule.minGapSec / 60) * 10) / 10}–${Math.round((c.schedule.maxGapSec / 60) * 10) / 10} min apart`,
             `${c.schedule.startHour}:00–${c.schedule.endHour}:00 ${c.schedule.timezone}`,
           ].map((t) => (
             <li key={t} className="flex gap-2.5">
@@ -290,16 +295,34 @@ function CampaignInner({ id }: { id: string }) {
   );
 }
 
+/** Senders for this campaign's channel, in one shape for the Senders tab and previews. */
+async function loadSenders(channel: Campaign["channel"]): Promise<AccountLite[]> {
+  if (channel === "email") return (await api<{ accounts: AccountLite[] }>("/api/accounts")).accounts;
+  const { accounts } = await api<{
+    accounts: { id: string; label: string; phone?: string; name?: string; status: string; paused: boolean; dailyLimit: number; sentToday: number }[];
+  }>("/api/wa/accounts");
+  return accounts.map((a) => ({
+    id: a.id,
+    email: a.phone ? `+${a.phone}` : "Not linked yet",
+    name: a.name || a.label || "WhatsApp",
+    status: a.status === "connected" ? (a.paused ? "paused" : "active") : "error",
+    dailyLimit: a.dailyLimit,
+    sentToday: a.sentToday,
+  }));
+}
+
 function TestModal({ campaign, defaultTo, onClose, beforeSend }: { campaign: Campaign; defaultTo: string; onClose: () => void; beforeSend: () => Promise<void> }) {
-  const [to, setTo] = useState(defaultTo);
+  const wa = campaign.channel === "whatsapp";
+  const [to, setTo] = useState(wa ? "" : defaultTo);
   const [step, setStep] = useState(0);
   const [busy, setBusy] = useState(false);
   async function send() {
     setBusy(true);
     try {
       await beforeSend();
-      const r = await api<{ sentTo: string; from: string }>(`/api/campaigns/${campaign.id}/action`, { body: { action: "test", to, step } });
-      toast.success(`Test sent to ${r.sentTo}`, { description: `From ${r.from}, using the first row of your sheet.` });
+      const r = await api<{ sentTo: string; from: string; pending?: boolean }>(`/api/campaigns/${campaign.id}/action`, { body: { action: "test", to, step } });
+      if (r.pending) toast.info(`Test to ${r.sentTo} is still being typed — it will arrive shortly`);
+      else toast.success(`Test sent to ${r.sentTo}`, { description: `From ${r.from}, using the first row of your sheet.` });
       onClose();
     } catch (e) {
       toast.error((e as Error).message);
@@ -311,22 +334,22 @@ function TestModal({ campaign, defaultTo, onClose, beforeSend }: { campaign: Cam
     <Modal
       open
       onClose={onClose}
-      title="Send a test email"
+      title={wa ? "Send a test WhatsApp message" : "Send a test email"}
       footer={
         <>
           <Button variant="secondary" onClick={onClose}>
             Cancel
           </Button>
-          <Button loading={busy} onClick={send}>
-            Send test
+          <Button loading={busy} onClick={send} disabled={!to.trim()}>
+            {busy && wa ? "Typing & sending…" : "Send test"}
           </Button>
         </>
       }
     >
       <div className="space-y-4">
         <div>
-          <Label>Send to</Label>
-          <Input type="email" value={to} onChange={(e) => setTo(e.target.value)} />
+          <Label hint={wa ? "your own WhatsApp number, with country code" : undefined}>Send to</Label>
+          <Input type={wa ? "tel" : "email"} placeholder={wa ? "+91 98765 43210" : "you@example.com"} value={to} onChange={(e) => setTo(e.target.value)} />
         </div>
         <div>
           <Label>Step</Label>
@@ -338,7 +361,10 @@ function TestModal({ campaign, defaultTo, onClose, beforeSend }: { campaign: Cam
             ))}
           </Select>
         </div>
-        <p className="text-xs text-faint">Variables are filled from the first row of your sheet. Test emails don&apos;t count toward analytics.</p>
+        <p className="text-xs text-faint">
+          Variables are filled from the first row of your sheet. Tests don&apos;t count toward analytics
+          {wa ? ", and it's sent with the same typing indicator as real messages (takes a few seconds)." : "."}
+        </p>
       </div>
     </Modal>
   );

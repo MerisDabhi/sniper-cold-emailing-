@@ -1,7 +1,15 @@
 export async function register() {
-  // On Vercel there is no long-running process — sending is driven by /api/cron/tick instead.
-  if (process.env.NEXT_RUNTIME === "nodejs" && !process.env.VERCEL) {
-    const { startWorker } = await import("./lib/worker");
-    startWorker();
+  // Long-running server (npm run dev / npm start): run the email sender and WhatsApp connections here.
+  // On Vercel there's no long-running process: email is sent via /api/cron/tick, and WhatsApp
+  // runs in a separate always-on worker (`npm run worker`).
+  if (process.env.NEXT_RUNTIME === "nodejs") {
+    if (!process.env.VERCEL) {
+      const { startEmailWorker } = await import("./lib/worker");
+      startEmailWorker();
+      if (process.env.WHATSAPP_ENABLED !== "false") {
+        const { startWhatsApp } = await import("./lib/whatsapp/manager");
+        startWhatsApp();
+      }
+    }
   }
 }

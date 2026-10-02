@@ -4,7 +4,8 @@ import { sb } from "@/lib/db";
 import { APP_URL } from "@/lib/google";
 import { SESSION_COOKIE, SESSION_MAX_AGE_SEC, signSession } from "@/lib/session";
 
-const MAX_FAILURES = 10;
+const MAX_FAILURES = 10; // per IP
+const MAX_FAILURES_GLOBAL = 50; // across all IPs — stops distributed guessing
 const WINDOW_MS = 15 * 60_000;
 
 function verifyPassword(password: string, stored: string) {
@@ -28,12 +29,18 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Login is not configured (APP_USERNAME / APP_PASSWORD_HASH missing)" }, { status: 500 });
   }
 
-  const ip = (req.headers.get("x-forwarded-for") || "").split(",")[0].trim() || req.headers.get("x-real-ip") || "local";
+  // x-real-ip is set by the platform (Vercel). Otherwise use the LAST x-forwarded-for entry — the one
+  // added by our own proxy — because anything before it can be faked by the client.
+  const forwarded = (req.headers.get("x-forwarded-for") || "").split(",").map((s) => s.trim()).filter(Boolean);
+  const ip = (req.headers.get("x-real-ip") || forwarded[forwarded.length - 1] || "local").slice(0, 64);
   const since = new Date(Date.now() - WINDOW_MS).toISOString();
 
-  const { count, error } = await sb().from("login_attempts").select("id", { count: "exact", head: true }).eq("ip", ip).gte("at", since);
-  if (error) return NextResponse.json({ error: "Could not reach the database" }, { status: 503 });
-  if ((count ?? 0) >= MAX_FAILURES) {
+  const [perIp, global] = await Promise.all([
+    sb().from("login_attempts").select("id", { count: "exact", head: true }).eq("ip", ip).gte("at", since),
+    sb().from("login_attempts").select("id", { count: "exact", head: true }).gte("at", since),
+  ]);
+  if (perIp.error || global.error) return NextResponse.json({ error: "Could not reach the database" }, { status: 503 });
+  if ((perIp.count ?? 0) >= MAX_FAILURES || (global.count ?? 0) >= MAX_FAILURES_GLOBAL) {
     return NextResponse.json({ error: "Too many failed attempts. Try again in 15 minutes." }, { status: 429 });
   }
 
@@ -46,7 +53,11 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Wrong username or password" }, { status: 401 });
   }
 
-  await sb().from("login_attempts").delete().eq("ip", ip);
+  // Clear this IP's failures, and forget attempts older than a day.
+  await Promise.all([
+    sb().from("login_attempts").delete().eq("ip", ip),
+    sb().from("login_attempts").delete().lt("at", new Date(Date.now() - 86_400_000).toISOString()),
+  ]);
   const res = NextResponse.json({ ok: true });
   res.cookies.set(SESSION_COOKIE, await signSession(expectedUser), {
     httpOnly: true,

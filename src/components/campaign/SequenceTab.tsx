@@ -2,6 +2,7 @@
 
 import { useMemo, useRef, useState } from "react";
 import { Clock, Eye, Plus, Sparkles, Trash2 } from "lucide-react";
+import { WhatsAppPreview } from "../Channel";
 import type { Campaign, SequenceStep } from "@/lib/types";
 import { leadVariables, render, textToHtml, variableKeys } from "@/lib/template";
 import { Badge, Button, Card, Input, Label, Textarea, cn } from "../ui";
@@ -62,6 +63,16 @@ export function SequenceTab({ c, sheet, accounts, onChange }: { c: Campaign; she
   const firstSubject = render(steps[0]?.subject || "", sampleVars, "preview" + steps[0]?.id);
   const previewSubject = isThreaded ? `Re: ${firstSubject}` : render(step.subject, sampleVars, "preview" + step.id);
   const previewBody = render(step.body, sampleVars, "preview" + step.id);
+  const wa = c.channel === "whatsapp";
+  const accent = wa ? "border-wa bg-wa-soft/60 ring-wa/10" : "border-primary bg-primary-soft/60 ring-primary/10";
+  // WhatsApp preview: the whole conversation so far, like the lead would see it.
+  const waMessages = steps.slice(0, idx + 1).map((s, i) => {
+    let text = render(s.body, sampleVars, "preview" + s.id).trim();
+    if (i === 0 && c.unsubscribeFooter && c.unsubscribeText.trim()) text += `\n\n${render(c.unsubscribeText, sampleVars).trim()}`;
+    const day = steps.slice(1, i + 1).reduce((n, x) => n + x.delayDays, 0);
+    return { text, label: i === 0 ? "Today" : `${day} day${day === 1 ? "" : "s"} later, if no reply` };
+  });
+  const contactName = [sampleVars.first_name, sampleVars.last_name].filter(Boolean).join(" ") || sampleVars.phone || "Lead";
 
   return (
     <div className="grid gap-6 lg:grid-cols-[260px_1fr]">
@@ -79,15 +90,23 @@ export function SequenceTab({ c, sheet, accounts, onChange }: { c: Campaign; she
               onClick={() => setActive(i)}
               className={cn(
                 "group w-full rounded-xl border p-3.5 text-left transition-all",
-                i === idx ? "border-primary bg-primary-soft/60 shadow-card ring-3 ring-primary/10" : "border-border bg-surface hover:border-border-strong",
+                i === idx ? cn(accent, "shadow-card ring-3") : "border-border bg-surface hover:border-border-strong",
               )}
             >
               <div className="flex items-center justify-between">
-                <span className={cn("text-xs font-semibold", i === idx ? "text-primary" : "text-muted")}>Step {i + 1}</span>
-                {i > 0 && !s.subject.trim() && <Badge tone="violet">Same thread</Badge>}
+                <span className={cn("text-xs font-semibold", i === idx ? (wa ? "text-wa" : "text-primary") : "text-muted")}>
+                  {i === 0 ? "First message" : `Follow-up ${i}`}
+                </span>
+                {!wa && i > 0 && !s.subject.trim() && <Badge tone="violet">Same thread</Badge>}
               </div>
-              <div className="mt-1 truncate text-[13px] font-medium">{s.subject || (i > 0 ? "Re: (previous subject)" : "No subject")}</div>
-              <div className="mt-0.5 line-clamp-2 text-xs text-faint">{s.body || "Empty"}</div>
+              {wa ? (
+                <div className="mt-1 line-clamp-3 text-[13px] text-muted">{s.body || "Empty"}</div>
+              ) : (
+                <>
+                  <div className="mt-1 truncate text-[13px] font-medium">{s.subject || (i > 0 ? "Re: (previous subject)" : "No subject")}</div>
+                  <div className="mt-0.5 line-clamp-2 text-xs text-faint">{s.body || "Empty"}</div>
+                </>
+              )}
             </button>
           </div>
         ))}
@@ -118,6 +137,7 @@ export function SequenceTab({ c, sheet, accounts, onChange }: { c: Campaign; she
             </div>
           )}
 
+          {!wa && (
           <div className="mb-4">
             <Label hint={idx > 0 ? "leave empty to reply in the same thread" : undefined}>Subject</Label>
             <Input
@@ -128,16 +148,17 @@ export function SequenceTab({ c, sheet, accounts, onChange }: { c: Campaign; she
               placeholder={idx > 0 ? "Re: (keeps the conversation in one thread)" : "Quick question about {{company}}"}
             />
           </div>
+          )}
 
           <div>
-            <Label>Body</Label>
+            <Label hint={wa ? `${step.body.length} characters · keep it short and personal` : undefined}>{wa ? "Message" : "Body"}</Label>
             <Textarea
               ref={bodyRef}
-              rows={13}
+              rows={wa ? 9 : 13}
               value={step.body}
               onFocus={() => setFocus("body")}
               onChange={(e) => update({ body: e.target.value })}
-              placeholder={"Hi {{first_name}},\n\n…"}
+              placeholder={wa ? "Hi {{first_name}} 👋 …" : "Hi {{first_name}},\n\n…"}
               className="font-[inherit] text-[14px]"
             />
           </div>
@@ -160,10 +181,41 @@ export function SequenceTab({ c, sheet, accounts, onChange }: { c: Campaign; she
             </div>
             <p className="mt-3 text-xs leading-relaxed text-faint">
               Fallback: <code className="text-muted">{"{{first_name|there}}"}</code> · Spintax (random pick per lead): <code className="text-muted">{"{Hi|Hey|Hello}"}</code>
+              {wa && (
+                <>
+                  {" "}
+                  · WhatsApp formatting: <code className="text-muted">*bold*</code> <code className="text-muted">_italic_</code>. Varying your wording with
+                  spintax keeps messages from looking automated.
+                </>
+              )}
             </p>
           </div>
         </Card>
 
+        {wa ? (
+          <div>
+            <div className="mb-3 flex items-center justify-between">
+              <span className="flex items-center gap-2 text-sm font-semibold">
+                <Eye className="size-4 text-muted" /> What the lead sees
+              </span>
+              {sheet && sheet.sample.length > 1 && (
+                <div className="flex items-center gap-1">
+                  {sheet.sample.map((_, i) => (
+                    <button
+                      key={i}
+                      onClick={() => setPreviewRow(i)}
+                      className={cn("size-6 rounded-md text-xs font-medium", i === previewRow ? "bg-wa text-white" : "text-muted hover:bg-surface-2")}
+                    >
+                      {i + 1}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+            <WhatsAppPreview contactName={contactName} messages={waMessages} typing />
+            <p className="mt-3 text-center text-xs text-faint">Sniper shows “typing…” for as long as a person would take to type each message.</p>
+          </div>
+        ) : (
         <Card className="overflow-hidden">
           <div className="flex items-center justify-between border-b border-border px-5 py-3">
             <span className="flex items-center gap-2 text-sm font-semibold">
@@ -212,6 +264,7 @@ export function SequenceTab({ c, sheet, accounts, onChange }: { c: Campaign; she
             )}
           </div>
         </Card>
+        )}
       </div>
     </div>
   );

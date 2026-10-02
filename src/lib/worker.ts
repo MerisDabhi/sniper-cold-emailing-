@@ -1,52 +1,41 @@
 import "server-only";
 import { checkReplies, tick } from "./engine";
-import { ready } from "./db";
-import { flushSheetStatuses } from "./sheetSync";
+import { withData } from "./run";
+import { acquireLease } from "./lease";
 
-const g = globalThis as unknown as { __sniperWorker?: { started: boolean; ticking: boolean; checking: boolean } };
+const g = globalThis as unknown as { __sniperEmailWorker?: boolean };
+
+/** One email sender run (also used by /api/cron/tick on Vercel). */
+export async function runEmailSender(opts: { replyCheck: boolean; replyLimit: number }) {
+  await withData(async () => {
+    await tick();
+    if (opts.replyCheck) await checkReplies(opts.replyLimit);
+  });
+}
 
 /**
- * Background loop for long-running servers (local / VPS): sends due emails every 15s,
- * checks replies every 3 minutes and writes sheet statuses every 10s.
- * On Vercel this is replaced by /api/cron/tick.
+ * Email sender loop for long-running processes (local dev, `npm start`, `npm run worker`):
+ * once a minute, sends at most one email per inbox and checks replies every 3rd minute.
+ * Only the process holding the "email" lease sends, so several copies never double up.
  */
-export function startWorker() {
-  if (g.__sniperWorker?.started) return;
-  const w: { started: boolean; ticking: boolean; checking: boolean } = { started: true, ticking: false, checking: false };
-  g.__sniperWorker = w;
-
-  setInterval(async () => {
-    if (w.ticking) return;
-    w.ticking = true;
+export function startEmailWorker() {
+  if (g.__sniperEmailWorker) return;
+  g.__sniperEmailWorker = true;
+  let running = false;
+  let runs = 0;
+  const run = async () => {
+    if (running) return;
+    running = true;
     try {
-      await ready();
-      await tick();
+      if (!(await acquireLease("email", 90))) return;
+      await runEmailSender({ replyCheck: runs++ % 3 === 0, replyLimit: 40 });
     } catch (e) {
-      console.error("[sniper] tick error", e);
+      console.error("[sniper] email sender error", e);
     } finally {
-      w.ticking = false;
+      running = false;
     }
-  }, 15_000);
-
-  setInterval(async () => {
-    if (w.checking) return;
-    w.checking = true;
-    try {
-      await ready();
-      await checkReplies(40);
-    } catch (e) {
-      console.error("[sniper] reply check error", e);
-    } finally {
-      w.checking = false;
-    }
-  }, 180_000);
-
-  setInterval(() => {
-    ready()
-      .then(flushSheetStatuses)
-      .catch((e) => console.error("[sniper] sheet sync error", e));
-  }, 10_000);
-
-  ready().catch((e) => console.error("[sniper] could not load data from Supabase:", e.message));
-  console.log("[sniper] background sender started");
+  };
+  setTimeout(run, 5_000);
+  setInterval(run, 60_000);
+  console.log("[sniper] email sender started");
 }
