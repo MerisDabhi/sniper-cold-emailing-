@@ -23,7 +23,7 @@ Copy `.env.example` to `.env.local` for local use; on Vercel, add the same varia
 | Variable | What it is |
 | --- | --- |
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | Your Google OAuth client |
-| `APP_URL` | `http://localhost:3000` locally, `https://your-domain.com` in production |
+| `APP_URL` | Optional. The app detects its domain automatically, so you can leave this empty. Set it only to force the domain used in unsubscribe and tracking links. |
 | `SESSION_SECRET` | Random string, **at least 32 characters**, that signs the login cookie. The app refuses to sign anyone in without it in production. |
 | `SUPABASE_URL`, `SUPABASE_SECRET_KEY` | Supabase → Project Settings → API Keys (**secret** key, server only) |
 | `APP_USERNAME` | Login username |
@@ -68,7 +68,7 @@ The simplest setup is one Railway/Render service running `npm run build && npm s
 ## 5. Deploy the web app on Vercel
 
 1. Import the GitHub repo in Vercel.
-2. Add all the environment variables above. Set `APP_URL` to your domain, and use a **new** `SESSION_SECRET` and `CRON_SECRET` for production.
+2. Add all the environment variables above, with a **new** `SESSION_SECRET` and `CRON_SECRET` for production. `APP_URL` isn't needed.
 3. Add your domain in Vercel and its redirect URI in Google Cloud (step 1).
 4. **Email sending.** If the always-on worker (see Hosting) runs with email on (the default), you're done. Otherwise something must call the email sender once a minute:
    - **Free:** create a job at [cron-job.org](https://cron-job.org) that calls `https://your-domain.com/api/cron/tick` **every minute**, with the request header `Authorization: Bearer <your CRON_SECRET>`.
@@ -95,7 +95,8 @@ Each run sends at most one email per inbox (respecting gaps, sending windows and
 
 - [ ] Node.js **20.12 or newer** on the host.
 - [ ] All environment variables set. Use a **new** `SESSION_SECRET` and `CRON_SECRET` for production, and change any secret that was ever shared in plain text (Google client secret, Supabase secret key, your password).
-- [ ] `APP_URL` is your real `https://` domain, and `https://your-domain.com/api/auth/google/callback` is in Google Cloud's redirect URIs.
+- [ ] `https://your-domain.com/api/auth/google/callback` is in Google Cloud's **Authorized redirect URIs**. Settings in the app shows the exact URL for the domain you're on.
+- [ ] Open the app once on your domain. It remembers the domain, which switches on unsubscribe links and open tracking in emails.
 - [ ] Google OAuth app **published** (otherwise Gmail logins expire every 7 days).
 - [ ] Exactly one always-on process for WhatsApp (`npm run worker` or `npm start`). Email runs from it too, or from cron-job.org calling `/api/cron/tick`.
 - [ ] Before a real campaign, send a **test** email and WhatsApp message to yourself.

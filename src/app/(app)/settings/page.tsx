@@ -13,6 +13,8 @@ import { Avatar, Badge, Button, Card, CardHeader, Segmented } from "@/components
 type Me = {
   owner: { email: string; name: string; picture?: string; connectedAt: string } | null;
   appUrl: string;
+  redirectUri: string;
+  publicUrl: string | null;
   isPublic: boolean;
   sheetWrite: boolean;
   sheetError: string | null;
@@ -30,7 +32,7 @@ export default function SettingsPage() {
     api<Me>("/api/me").then(setMe);
   }, []);
 
-  const redirect = me ? `${me.appUrl}/api/auth/google/callback` : "";
+  const redirect = me?.redirectUri || "";
 
   return (
     <div className="animate-fade-up max-w-3xl space-y-6">
@@ -97,7 +99,9 @@ export default function SettingsPage() {
         <CardHeader title="Google Cloud setup" description="These must match your OAuth client in Google Cloud Console." />
         <div className="space-y-4 p-5 text-sm">
           <div>
-            <div className="mb-1.5 text-[13px] font-medium">Authorized redirect URI</div>
+            <div className="mb-1.5 text-[13px] font-medium">
+              Authorized redirect URI <span className="font-normal text-faint">· for the domain you&apos;re on right now</span>
+            </div>
             <div className="flex items-center gap-2 rounded-lg border border-border bg-surface-2 px-3 py-2 font-mono text-[13px]">
               <span className="flex-1 truncate">{redirect}</span>
               <button
@@ -107,6 +111,10 @@ export default function SettingsPage() {
                 <Copy className="size-3.5" />
               </button>
             </div>
+            <p className="mt-2 text-xs leading-relaxed text-faint">
+              This follows whatever domain you open Sniper on — nothing to change when you connect your own domain. Add one line per domain you
+              use under <b className="text-muted">Authorized redirect URIs</b> in Google Cloud (e.g. your domain and http://localhost:3000).
+            </p>
           </div>
           <ul className="space-y-2 text-[13px] text-muted">
             {["Gmail API and Google Sheets API enabled", "Every sending inbox added as a Test user (while the app is in Testing mode)", "Publish the app to Production to stop tokens expiring every 7 days"].map((t) => (
@@ -117,7 +125,8 @@ export default function SettingsPage() {
           </ul>
           {!me?.isPublic && (
             <p className="rounded-lg bg-warning-soft px-3 py-2.5 text-[13px] text-warning">
-              Running on localhost: open tracking and unsubscribe links are disabled. Reply-based unsubscribes still work. Deploy and set APP_URL to enable them.
+              Running on localhost: open tracking and unsubscribe links are off. Reply-based unsubscribes still work. Open Sniper once on your
+              own domain and they switch on automatically.
             </p>
           )}
         </div>

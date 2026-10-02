@@ -297,7 +297,7 @@ export function OptionsTab({ c, onChange, isPublic, sheetWrite }: { c: Campaign;
             text={
               isPublic
                 ? "Adds an invisible 1×1 image. Turning this off slightly improves deliverability."
-                : "Needs the app to run on a public URL (set APP_URL). Unavailable on localhost."
+                : "Needs the app on a public domain — open Sniper on your domain once and this becomes available."
             }
           >
             <Switch checked={c.trackOpens && isPublic} disabled={!isPublic} onChange={(v) => onChange({ trackOpens: v })} />

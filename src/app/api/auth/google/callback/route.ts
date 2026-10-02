@@ -1,12 +1,13 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db, id, save } from "@/lib/db";
 import { withData } from "@/lib/api";
-import { APP_URL, errorMessage, fetchProfile, oauthClient } from "@/lib/google";
+import { errorMessage, fetchProfile, oauthClient } from "@/lib/google";
+import { OAUTH_CALLBACK_PATH, requestOrigin } from "@/lib/url";
 
 const MAX_ACCOUNTS = 25;
 
-function back(path: string, params: Record<string, string>) {
-  const u = new URL(path, APP_URL);
+function back(origin: string, path: string, params: Record<string, string>) {
+  const u = new URL(path, origin);
   for (const [k, v] of Object.entries(params)) u.searchParams.set(k, v);
   const res = NextResponse.redirect(u);
   res.cookies.delete("sniper_oauth_state");
@@ -18,23 +19,24 @@ function back(path: string, params: Record<string, string>) {
  * this only stores Google access — for the Sheets account ("owner") or a Gmail sending inbox.
  */
 export async function GET(req: NextRequest) {
+  const origin = requestOrigin(req.headers, req.nextUrl.origin);
   const sp = req.nextUrl.searchParams;
   const state = sp.get("state") || "";
   const purpose = state.startsWith("gmail.") ? "gmail" : "owner";
   const errPath = purpose === "gmail" ? "/accounts" : "/welcome";
 
-  if (sp.get("error")) return back(errPath, { error: sp.get("error") === "access_denied" ? "Access was denied" : sp.get("error")! });
-  if (!state || state !== req.cookies.get("sniper_oauth_state")?.value) return back(errPath, { error: "Login expired, please try again" });
+  if (sp.get("error")) return back(origin, errPath, { error: sp.get("error") === "access_denied" ? "Access was denied" : sp.get("error")! });
+  if (!state || state !== req.cookies.get("sniper_oauth_state")?.value) return back(origin, errPath, { error: "Login expired, please try again" });
 
   try {
-    const client = oauthClient();
+    const client = oauthClient(origin + OAUTH_CALLBACK_PATH);
     const { tokens } = await client.getToken(sp.get("code") || "");
     client.setCredentials(tokens);
     const profile = await fetchProfile(client);
     const granted = tokens.scope || "";
 
     if (purpose === "owner") {
-      if (!granted.includes("spreadsheets")) return back("/welcome", { error: "Please allow access to Google Sheets" });
+      if (!granted.includes("spreadsheets")) return back(origin, "/welcome", { error: "Please allow access to Google Sheets" });
       await withData(async () => {
         const d = db();
         const sameAccount = d.owner?.email === profile.email;
@@ -45,10 +47,10 @@ export async function GET(req: NextRequest) {
         };
         save();
       });
-      return back("/dashboard", {});
+      return back(origin, "/dashboard", {});
     }
 
-    if (!granted.includes("gmail.send")) return back("/accounts", { error: "Please tick the Gmail permission checkboxes on Google's screen" });
+    if (!granted.includes("gmail.send")) return back(origin, "/accounts", { error: "Please tick the Gmail permission checkboxes on Google's screen" });
 
     const outcome = await withData(async () => {
       const d = db();
@@ -76,9 +78,9 @@ export async function GET(req: NextRequest) {
       save();
       return "ok";
     });
-    if (outcome === "full") return back("/accounts", { error: `You can connect up to ${MAX_ACCOUNTS} inboxes` });
-    return back("/accounts", { connected: profile.email });
+    if (outcome === "full") return back(origin, "/accounts", { error: `You can connect up to ${MAX_ACCOUNTS} inboxes` });
+    return back(origin, "/accounts", { connected: profile.email });
   } catch (err) {
-    return back(errPath, { error: errorMessage(err) });
+    return back(origin, errPath, { error: errorMessage(err) });
   }
 }

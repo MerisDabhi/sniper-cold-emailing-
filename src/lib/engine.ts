@@ -1,6 +1,7 @@
 import "server-only";
 import { db, fetchLeads, id, pushEvent, sb, token } from "./db";
-import { APP_URL, checkThread, errorMessage, getSheetRows, isAuthError, sendGmail } from "./google";
+import { checkThread, errorMessage, getSheetRows, isAuthError, sendGmail } from "./google";
+import { publicUrl } from "./url";
 import { EMAIL_RE, leadVariables, render, textToHtml } from "./template";
 import { alreadyContacted, claimContact, claimStep, recordStepMessage, releaseContact, releaseStep, syncClaimedLead } from "./dedupe";
 import { leadMatch, queueSheetStatus, stamp } from "./sheetSync";
@@ -8,7 +9,6 @@ import { contactKey, formatPhone, normalizePhone } from "./phone";
 import type { Campaign, Channel, GmailAccount, Lead } from "./types";
 
 const DAY = 86_400_000;
-export const IS_PUBLIC = !/localhost|127\.0\.0\.1|\[::1\]/.test(APP_URL);
 
 // ─── Time helpers ──────────────────────────────────────────────────────────
 
@@ -354,7 +354,10 @@ export function composeEmail(c: Campaign, lead: Lead, account: GmailAccount, ste
   if (account.signature.trim()) text += `\n\n${render(account.signature, vars, seed).trim()}`;
   let html = textToHtml(text);
 
-  const unsubUrl = `${APP_URL}/u/${lead.token}`;
+  // Unsubscribe links and open tracking need a public domain the recipient can reach.
+  const base = publicUrl();
+  const IS_PUBLIC = !!base;
+  const unsubUrl = `${base}/u/${lead.token}`;
   if (c.unsubscribeFooter && c.unsubscribeText.trim()) {
     const note = render(c.unsubscribeText, vars, seed).trim();
     text += `\n\n${note}${IS_PUBLIC ? ` ${unsubUrl}` : ""}`;
@@ -362,7 +365,7 @@ export function composeEmail(c: Campaign, lead: Lead, account: GmailAccount, ste
       .replace(/</g, "&lt;")}${IS_PUBLIC ? ` <a href="${unsubUrl}" style="color:#888">Unsubscribe</a>` : ""}</div>`;
   }
   if (c.trackOpens && IS_PUBLIC) {
-    html += `<img src="${APP_URL}/api/t/o/${lead.token}" width="1" height="1" alt="" style="display:none">`;
+    html += `<img src="${base}/api/t/o/${lead.token}" width="1" height="1" alt="" style="display:none">`;
   }
 
   return {
@@ -371,7 +374,7 @@ export function composeEmail(c: Campaign, lead: Lead, account: GmailAccount, ste
     html,
     threadId: stepIndex > 0 ? lead.threadId : undefined,
     inReplyTo: stepIndex > 0 && isFollowUpInThread ? lead.firstMessageId : undefined,
-    listUnsubscribe: `<mailto:${account.email}?subject=unsubscribe>${IS_PUBLIC ? `, <${APP_URL}/api/unsubscribe?t=${lead.token}>` : ""}`,
+    listUnsubscribe: `<mailto:${account.email}?subject=unsubscribe>${IS_PUBLIC ? `, <${base}/api/unsubscribe?t=${lead.token}>` : ""}`,
     oneClick: IS_PUBLIC,
   };
 }

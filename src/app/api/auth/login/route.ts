@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import crypto from "crypto";
 import { sb } from "@/lib/db";
-import { APP_URL } from "@/lib/google";
+import { requestOrigin } from "@/lib/url";
 import { SESSION_COOKIE, SESSION_MAX_AGE_SEC, signSession } from "@/lib/session";
 
 const MAX_FAILURES = 10; // per IP
@@ -63,7 +63,7 @@ export async function POST(req: NextRequest) {
     httpOnly: true,
     sameSite: "lax",
     path: "/",
-    secure: APP_URL.startsWith("https"),
+    secure: requestOrigin(req.headers, req.nextUrl.origin).startsWith("https"),
     maxAge: SESSION_MAX_AGE_SEC,
   });
   return res;

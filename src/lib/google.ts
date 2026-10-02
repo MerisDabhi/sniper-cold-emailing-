@@ -4,8 +4,6 @@ import type { OAuth2Client } from "google-auth-library";
 import { db, save } from "./db";
 import type { GmailAccount, OAuthTokens } from "./types";
 
-export const APP_URL = (process.env.APP_URL || "http://localhost:3000").replace(/\/$/, "");
-export const REDIRECT_URI = `${APP_URL}/api/auth/google/callback`;
 
 export const OWNER_SCOPES = [
   "openid",
@@ -31,15 +29,19 @@ export const GMAIL_SCOPES = [
   "https://www.googleapis.com/auth/gmail.readonly",
 ];
 
-export function oauthClient(): OAuth2Client {
+/**
+ * Google OAuth client. `redirectUri` is only needed for the sign-in flow — it's built from the
+ * domain the user is on (see url.ts), so any domain works as long as it's registered in Google Cloud.
+ */
+export function oauthClient(redirectUri?: string): OAuth2Client {
   if (!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_CLIENT_SECRET) {
-    throw new Error("GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET are missing in .env.local");
+    throw new Error("GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET are missing");
   }
-  return new google.auth.OAuth2(process.env.GOOGLE_CLIENT_ID, process.env.GOOGLE_CLIENT_SECRET, REDIRECT_URI);
+  return new google.auth.OAuth2(process.env.GOOGLE_CLIENT_ID, process.env.GOOGLE_CLIENT_SECRET, redirectUri);
 }
 
-export function authUrl(purpose: "owner" | "gmail", state: string, loginHint?: string) {
-  return oauthClient().generateAuthUrl({
+export function authUrl(purpose: "owner" | "gmail", state: string, redirectUri: string, loginHint?: string) {
+  return oauthClient(redirectUri).generateAuthUrl({
     access_type: "offline",
     prompt: "consent select_account",
     scope: purpose === "owner" ? OWNER_SCOPES : GMAIL_SCOPES,
