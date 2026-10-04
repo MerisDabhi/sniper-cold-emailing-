@@ -58,9 +58,17 @@ const FINAL_STATUSES = ["replied", "unsubscribed", "bounced", "duplicate"];
 
 const camel = (s: string) => s.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase());
 
+/** Integer columns (bigint ms timestamps and int counters): Postgres rejects fractions like 1790968333036.69. */
+const INTEGER_COLS = new Set([
+  "next_send_at", "next_at", "last_sent_at", "replied_at", "opened_at", "last_checked_at", "at", "daily_limit", "step_index", "step",
+]);
+
 function toRow(obj: Row, cols: string[]): Row {
   const r: Row = {};
-  for (const c of cols) r[c] = obj[camel(c)] ?? null;
+  for (const c of cols) {
+    const v = obj[camel(c)] ?? null;
+    r[c] = typeof v === "number" && INTEGER_COLS.has(c) ? Math.round(v) : v;
+  }
   return r;
 }
 
@@ -221,7 +229,25 @@ function rowsOf(t: TableName, d: DB): Row[] {
 export async function persist() {
   const s = store();
   const d = s.data;
-  for (const t of ["owner", "accounts", "campaigns", "leads", "unsubscribes"] as TableName[]) {
+  const failures: string[] = [];
+  // Leads first: they record what was sent. A failure in one table doesn't stop the others.
+  for (const t of ["leads", "unsubscribes", "campaigns", "accounts", "owner"] as TableName[]) {
+    try {
+      await persistTable(s, d, t);
+    } catch (err) {
+      failures.push((err as Error).message);
+    }
+  }
+  try {
+    await persistEvents(s);
+  } catch (err) {
+    failures.push((err as Error).message);
+  }
+  if (failures.length) throw new Error(failures.join("; "));
+}
+
+async function persistTable(s: Store, d: DB, t: TableName) {
+  {
     const { key, cols } = COLUMNS[t];
     const seen = new Set<string>();
     const inserts: Row[] = [];
@@ -274,6 +300,9 @@ export async function persist() {
       for (const id of chunk) s.snap[t].delete(id);
     }
   }
+}
+
+async function persistEvents(s: Store) {
   while (s.eventQueue.length) {
     const batch = s.eventQueue.splice(0, 1000);
     const { error } = await sb()

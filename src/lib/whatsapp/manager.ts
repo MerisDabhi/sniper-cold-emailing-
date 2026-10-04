@@ -16,14 +16,29 @@ import { handleIncoming, humanSend, resolveJid, waTick } from "./sender";
  */
 
 const LEASE = "whatsapp";
-type Conn = { sock: WASocket; status: string; retries: number; retryTimer?: NodeJS.Timeout; closing?: boolean };
+type Conn = { sock: WASocket; status: string; closing?: boolean };
+/** A connection must stay up this long before the reconnect backoff starts over. */
+const STABLE_MS = 2 * 60_000;
 
 class WhatsAppManager {
   private conns = new Map<string, Conn>();
   /** Numbers waiting out a reconnect backoff — the sync loop leaves them alone. */
   private retrying = new Set<string>();
+  /** Numbers whose socket is being set up right now, so the same number is never opened twice. */
+  private connecting = new Set<string>();
+  /** Failed reconnects in a row per number (drives the backoff). */
+  private failures = new Map<string, number>();
+  private commanding = false;
   private active = false;
   private ticking = false;
+  stopping = false;
+
+  /** Stop sending and wait (up to `ms`) for the message being typed/sent to finish. */
+  async stop(ms = 60_000) {
+    this.stopping = true;
+    const until = Date.now() + ms;
+    while (this.ticking && Date.now() < until) await new Promise((r) => setTimeout(r, 250));
+  }
   private syncing = false;
 
   start() {
@@ -82,7 +97,6 @@ class WhatsAppManager {
     const c = this.conns.get(id);
     if (!c) return;
     c.closing = true;
-    clearTimeout(c.retryTimer);
     try {
       c.sock.end(undefined);
     } catch {}
@@ -101,7 +115,18 @@ class WhatsAppManager {
     console.log(`[whatsapp] removed ${id}`);
   }
 
-  private async connect(id: string, retries = 0) {
+  private async connect(id: string) {
+    // One socket per number, always: two would keep knocking each other offline.
+    if (this.connecting.has(id) || this.conns.has(id)) return;
+    this.connecting.add(id);
+    try {
+      await this.open(id);
+    } finally {
+      this.connecting.delete(id);
+    }
+  }
+
+  private async open(id: string) {
     const { default: makeWASocket, Browsers, DisconnectReason, fetchLatestBaileysVersion, jidNormalizedUser, makeCacheableSignalKeyStore } =
       await import("baileys");
     const { default: pino } = await import("pino");
@@ -118,20 +143,22 @@ class WhatsAppManager {
       syncFullHistory: false,
       generateHighQualityLinkPreview: false,
     });
-    const conn: Conn = { sock, status: "connecting", retries };
+    const conn: Conn = { sock, status: "connecting" };
     this.conns.set(id, conn);
     let qrShown = 0;
+    let openedAt = 0;
 
     sock.ev.on("creds.update", saveCreds);
 
     sock.ev.on("connection.update", async (u) => {
-      if (conn.closing) return;
+      // Ignore a socket we already replaced or dropped — it must never touch the current one.
+      if (conn.closing || this.conns.get(id) !== conn) return;
       if (u.qr) {
         qrShown++;
         await this.update(id, { status: "qr", qr: u.qr, error: null });
       }
       if (u.connection === "open") {
-        conn.retries = 0;
+        openedAt = Date.now();
         conn.status = "connected";
         const me = sock.user;
         await this.update(id, {
@@ -146,8 +173,10 @@ class WhatsAppManager {
         console.log(`[whatsapp] ${id} connected as +${me?.id ? jidNormalizedUser(me.id).split("@")[0] : "?"}`);
       }
       if (u.connection === "close") {
+        conn.closing = true;
         this.conns.delete(id);
         const code = (u.lastDisconnect?.error as { output?: { statusCode?: number } } | undefined)?.output?.statusCode;
+        console.log(`[whatsapp] ${id} disconnected (code ${code ?? "?"})`);
         if (code === DisconnectReason.loggedOut) {
           await clearAuthState(id);
           await this.update(id, { status: "logged_out", qr: null, error: "Unlinked from the phone. Scan a new QR code to reconnect." });
@@ -164,13 +193,19 @@ class WhatsAppManager {
           return;
         }
         // Temporary drop (network, WhatsApp restart, right after pairing): reconnect with backoff.
-        const wait = code === DisconnectReason.restartRequired ? 500 : Math.min(60_000, 2000 * 2 ** retries);
-        if (linked && code !== DisconnectReason.restartRequired) await this.update(id, { error: "Reconnecting…" });
+        // The backoff only starts over once a connection has stayed up for a while, so a number
+        // that keeps dropping right after connecting slows down instead of hammering WhatsApp.
+        const stable = openedAt > 0 && Date.now() - openedAt > STABLE_MS;
+        const fails = stable ? 0 : this.failures.get(id) || 0;
+        this.failures.set(id, fails + 1);
+        const restart = code === DisconnectReason.restartRequired && fails < 3;
+        const wait = restart ? 500 : Math.min(5 * 60_000, 2000 * 2 ** fails);
         this.retrying.add(id);
         setTimeout(() => {
           this.retrying.delete(id);
-          if (this.active && !this.conns.has(id)) this.connect(id, retries + 1).catch((e) => console.error("[whatsapp]", e));
+          if (this.active) this.connect(id).catch((e) => console.error("[whatsapp]", e));
         }, wait);
+        if (linked && !restart) await this.update(id, { error: "Reconnecting…" });
       }
     });
 
@@ -197,7 +232,7 @@ class WhatsAppManager {
 
   /** Send due messages from every connected, unpaused number. */
   private async sendTick() {
-    if (!this.active || this.ticking) return;
+    if (!this.active || this.ticking || this.stopping) return;
     this.ticking = true;
     try {
       const live = new Map([...this.conns].filter(([, c]) => c.status === "connected").map(([id, c]) => [id, c.sock]));
@@ -216,9 +251,26 @@ class WhatsAppManager {
 
   /** Commands queued by the app, e.g. "send a test message". */
   private async runCommands() {
-    if (!this.active) return;
+    if (!this.active || this.commanding || this.stopping) return;
+    this.commanding = true;
+    try {
+      await this.runPendingCommands();
+    } finally {
+      this.commanding = false;
+    }
+  }
+
+  private async runPendingCommands() {
+    // Anything older than 2 minutes is stale (the app stopped waiting) — never send it late.
+    const fresh = new Date(Date.now() - 120_000).toISOString();
+    await sb().from("wa_commands").update({ status: "failed", result: "Timed out before it could be sent." }).eq("status", "pending").lt("created_at", fresh);
     const { data } = await sb().from("wa_commands").select("*").eq("status", "pending").order("created_at").limit(5);
-    for (const cmd of data || []) {
+    for (const row of data || []) {
+      // Claim it first: only the run that flips it from "pending" may send, so a command is
+      // executed exactly once even though typing a message takes longer than this loop's interval.
+      const { data: claimed } = await sb().from("wa_commands").update({ status: "running" }).eq("id", row.id).eq("status", "pending").select("*");
+      const cmd = claimed?.[0];
+      if (!cmd) continue;
       const conn = this.conns.get(cmd.account_id);
       const finish = (status: "done" | "failed", result: string) => sb().from("wa_commands").update({ status, result }).eq("id", cmd.id);
       if (!conn || conn.status !== "connected") {
@@ -250,4 +302,8 @@ export function startWhatsApp() {
   if (g.__sniperWhatsApp) return;
   g.__sniperWhatsApp = new WhatsAppManager();
   g.__sniperWhatsApp.start();
+}
+
+export async function stopWhatsApp() {
+  await g.__sniperWhatsApp?.stop();
 }

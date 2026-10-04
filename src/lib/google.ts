@@ -259,6 +259,17 @@ export async function sendGmail(account: GmailAccount, mail: OutgoingEmail) {
   return { id: data.id!, threadId: data.threadId!, messageId };
 }
 
+/** Find the most recent email this inbox sent to `to` in the last 2 days (used to resolve interrupted sends). */
+export async function findSentTo(account: GmailAccount, to: string) {
+  const gmail = google.gmail({ version: "v1", auth: accountClient(account) });
+  const { data } = await gmail.users.messages.list({ userId: "me", q: `in:sent to:${to} newer_than:2d`, maxResults: 1 });
+  const id = data.messages?.[0]?.id;
+  if (!id) return null;
+  const { data: msg } = await gmail.users.messages.get({ userId: "me", id, format: "metadata", metadataHeaders: ["Subject", "Message-ID"] });
+  const h = (n: string) => msg.payload?.headers?.find((x) => x.name?.toLowerCase() === n.toLowerCase())?.value || undefined;
+  return { id, threadId: msg.threadId || undefined, subject: h("Subject"), messageId: h("Message-ID"), at: Number(msg.internalDate) || Date.now() };
+}
+
 export type ThreadCheck = { replied: boolean; bounced: boolean; unsubscribe: boolean; at?: number; snippet?: string };
 
 const UNSUB_RE = /\b(unsubscribe|remove me|stop emailing|take me off|not interested|opt[ -]?out)\b/i;

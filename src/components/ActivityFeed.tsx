@@ -1,13 +1,13 @@
 "use client";
 
-import { AlertTriangle, CopyX, Eye, MailX, Reply, Send, Undo2 } from "lucide-react";
+import { AlertTriangle, CopyX, Eye, MailX, PenLine, Reply, Send, Undo2 } from "lucide-react";
 import { timeAgo } from "@/lib/client";
 import { cn } from "./ui";
 import { WhatsAppGlyph, type ChannelKind } from "./Channel";
 
 export type FeedEvent = {
   id: string;
-  type: "sent" | "reply" | "open" | "bounce" | "unsubscribe" | "error" | "duplicate";
+  type: "sent" | "reply" | "open" | "bounce" | "unsubscribe" | "error" | "duplicate" | "manual";
   at: number;
   email?: string;
   step?: number;
@@ -24,6 +24,7 @@ const META: Record<FeedEvent["type"], { icon: typeof Send; cls: string; verb: (w
   bounce: { icon: Undo2, cls: "bg-danger-soft text-danger", verb: (wa) => (wa ? "Not on WhatsApp:" : "Bounced:") },
   unsubscribe: { icon: MailX, cls: "bg-warning-soft text-warning", verb: () => "Unsubscribed:" },
   error: { icon: AlertTriangle, cls: "bg-danger-soft text-danger", verb: () => "Failed to send to" },
+  manual: { icon: PenLine, cls: "bg-primary-soft text-primary", verb: () => "You replied to" },
   duplicate: { icon: CopyX, cls: "bg-violet/10 text-violet", verb: () => "Skipped (already contacted):" },
 };
 

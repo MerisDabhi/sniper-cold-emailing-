@@ -1,6 +1,6 @@
 import "server-only";
 import { db, fetchLeads, id, pushEvent, sb, token } from "./db";
-import { checkThread, errorMessage, getSheetRows, isAuthError, sendGmail } from "./google";
+import { checkThread, errorMessage, findSentTo, getSheetRows, isAuthError, sendGmail } from "./google";
 import { publicUrl } from "./url";
 import { EMAIL_RE, leadVariables, render, textToHtml } from "./template";
 import { alreadyContacted, claimContact, claimStep, recordStepMessage, releaseContact, releaseStep, syncClaimedLead } from "./dedupe";
@@ -164,15 +164,31 @@ export async function syncLeads(c: Campaign) {
   return { added, invalid, duplicate, alreadyContacted: alreadySent, total: rows.length };
 }
 
-/** Move not-yet-contacted leads off a sender that was removed from a campaign / deleted. */
+/**
+ * Share the not-yet-contacted leads evenly over the campaign's senders. Runs when senders are
+ * added or removed, so a new inbox gets its share and nothing stays on a removed one.
+ * Leads already in a sequence keep their sender, so follow-ups stay in the same thread.
+ */
 export async function rebalanceLeads(c: Campaign) {
-  const valid = senderIds(c);
+  const all = senderIds(c);
+  const active = activeSenderIds(c).filter((x) => all.includes(x));
+  const valid = active.length ? active : all;
   if (!valid.length) return;
-  const orphans = await fetchLeads(
-    (q) => q.eq("campaign_id", c.id).eq("status", "pending").eq("step_index", 0).not("account_id", "in", `(${valid.join(",")})`),
-    { all: true },
-  );
-  orphans.forEach((l, i) => (l.accountId = valid[i % valid.length]));
+  const waiting = await fetchLeads((q) => q.eq("campaign_id", c.id).eq("status", "pending").eq("step_index", 0), { all: true });
+  // A lead that is being sent right now (claimed) must stay with the sender that is emailing it.
+  const claimed = new Set<string>();
+  for (let from = 0; ; from += 1000) {
+    const { data, error } = await sb().from("sends").select("lead_id").eq("campaign_id", c.id).eq("step", 0).range(from, from + 999);
+    if (error) throw new Error(`Supabase: could not read send claims: ${error.message}`);
+    data?.forEach((r) => claimed.add(r.lead_id));
+    if (!data || data.length < 1000) break;
+  }
+  waiting
+    .filter((l) => !claimed.has(l.id))
+    .forEach((l, i) => {
+    const to = valid[i % valid.length];
+    if (l.accountId !== to) l.accountId = to;
+  });
 }
 
 // ─── Shared sending pipeline ───────────────────────────────────────────────
@@ -181,7 +197,11 @@ export async function rebalanceLeads(c: Campaign) {
 /** Campaigns a sender may send for right now: in their sending window and under today's quota. */
 export function eligibleCampaigns(accountId: string, campaigns: Campaign[], now: number) {
   return campaigns.filter(
-    (c) => c.accountIds.includes(accountId) && inWindow(c, now) && campaignSentToday(c, accountId, now) < perAccountQuota(c),
+    (c) =>
+      c.accountIds.includes(accountId) &&
+      inWindow(c, now) &&
+      campaignSentToday(c, accountId, now) < perAccountQuota(c) &&
+      campaignSentToday(c, undefined, now) < c.dailyLimit,
   );
 }
 
@@ -231,7 +251,14 @@ export type ClaimResult = "ok" | "skip";
  * Pre-send checks shared by email and WhatsApp: unsubscribed, sequence finished, and the two
  * duplicate guards (step claim + one-cold-message-per-contact). "ok" means it's safe to send.
  */
-export async function prepareSend(c: Campaign, lead: Lead, accountId: string): Promise<ClaimResult> {
+/**
+ * What to do with a step that was claimed >10 minutes ago but never recorded (the process was
+ * stopped mid-send). Return true if it was actually sent (and has been recorded), false if not.
+ * Without a resolver the step is assumed sent — never risk a duplicate.
+ */
+export type StaleResolver = (c: Campaign, lead: Lead, step: number) => Promise<boolean>;
+
+export async function prepareSend(c: Campaign, lead: Lead, accountId: string, resolveStale?: StaleResolver): Promise<ClaimResult> {
   const d = db();
   if (d.unsubscribes.some((u) => u.email === contactKey(lead))) {
     lead.status = "unsubscribed";
@@ -244,7 +271,12 @@ export async function prepareSend(c: Campaign, lead: Lead, accountId: string): P
   const step = lead.stepIndex;
   if (!(await claimStep(lead, step, accountId))) {
     // This step was already claimed — never resend it. Find out what really happened.
-    if ((await syncClaimedLead(lead, step)) === "stale") advanceLead(c, lead); // crashed right after sending
+    if ((await syncClaimedLead(lead, step)) === "stale") {
+      // Stopped mid-send earlier. Check whether it really went out.
+      const sent = resolveStale ? await resolveStale(c, lead, step).catch(() => true) : true;
+      if (!sent) await releaseClaims(lead, step); // never sent: free it, it's retried next run
+      else if (lead.stepIndex === step) advanceLead(c, lead);
+    }
     return "skip";
   }
   if (step === 0) {
@@ -311,7 +343,7 @@ export function advanceLead(c: Campaign, lead: Lead) {
     lead.status = "completed";
   } else {
     lead.status = "in_progress";
-    lead.nextAt = Date.now() + c.steps[lead.stepIndex].delayDays * DAY;
+    lead.nextAt = Math.round(Date.now() + c.steps[lead.stepIndex].delayDays * DAY);
   }
 }
 
@@ -389,7 +421,7 @@ async function sendNextEmail(account: GmailAccount, campaigns: Campaign[], now: 
     if (!next) return;
     tried.add(next.lead.id);
     try {
-      if ((await prepareSend(next.c, next.lead, account.id)) === "ok") {
+      if ((await prepareSend(next.c, next.lead, account.id, (c, lead, step) => resolveStaleEmail(account, c, lead, step))) === "ok") {
         pick = next;
         break;
       }
@@ -417,7 +449,7 @@ async function sendNextEmail(account: GmailAccount, campaigns: Campaign[], now: 
     }
     lead.threadId = lead.threadId || res.threadId;
     recordSent(c, lead, account.id, account.email, mail.subject, res.id);
-    account.nextSendAt = Date.now() + rand(c.schedule.minGapSec, c.schedule.maxGapSec) * 1000;
+    account.nextSendAt = Math.round(Date.now() + rand(c.schedule.minGapSec, c.schedule.maxGapSec) * 1000);
   } catch (err) {
     await releaseClaims(lead, step);
     const msg = errorMessage(err);
@@ -436,6 +468,20 @@ async function sendNextEmail(account: GmailAccount, campaigns: Campaign[], now: 
     pushEvent({ type: "error", campaignId: c.id, accountId: account.id, leadId: lead.id, email: leadLabel(lead), detail: msg });
     console.error(`[sniper] send failed ${account.email} → ${lead.email}: ${msg}`);
   }
+}
+
+/** An email whose send was interrupted: look in the inbox's Sent folder and record it if it went out. */
+async function resolveStaleEmail(account: GmailAccount, c: Campaign, lead: Lead, step: number): Promise<boolean> {
+  const found = await findSentTo(account, lead.email!);
+  if (!found) return false;
+  if (step === 0) {
+    lead.firstSubject = found.subject;
+    lead.firstMessageId = found.messageId;
+  }
+  lead.threadId = lead.threadId || found.threadId;
+  recordSent(c, lead, account.id, account.email, found.subject || "", found.id);
+  lead.lastSentAt = found.at;
+  return true;
 }
 
 /** One email sender run: at most one email per inbox. Works in "base" or "full" scope. */

@@ -2,10 +2,11 @@ import "server-only";
 import type { WASocket } from "baileys";
 import { db, fetchLeads, pushEvent, sb } from "../db";
 import { render } from "../template";
-import { formatPhone } from "../phone";
+import { contactKey, formatPhone } from "../phone";
 import { leadMatch, queueSheetStatus } from "../sheetSync";
 import {
   accountSentLast24h,
+  addUnsubscribe,
   finishCampaigns,
   leadLabel,
   loadDueLeads,
@@ -153,9 +154,22 @@ export async function handleIncoming(accountId: string, jid: string, altJid: str
   const phones = [jid, altJid].filter((j): j is string => !!j && j.endsWith("@s.whatsapp.net")).map((j) => j.split("@")[0].split(":")[0]);
   const jids = [jid, altJid].filter((j): j is string => !!j);
   const found = new Map<string, Lead>();
-  const open = ["in_progress", "completed"];
   const add = (rows: Lead[]) => rows.forEach((l) => found.set(l.id, l));
-  if (phones.length) add(await fetchLeads((q) => q.eq("account_id", accountId).in("status", open).is("replied_at", null).in("phone", phones)));
-  add(await fetchLeads((q) => q.eq("account_id", accountId).in("status", open).is("replied_at", null).in("wa_jid", jids)));
-  for (const lead of found.values()) await recordReply(lead, accountId, at, text, STOP_RE.test(text));
+  if (phones.length) add(await fetchLeads((q) => q.eq("account_id", accountId).gt("step_index", 0).in("phone", phones)));
+  add(await fetchLeads((q) => q.eq("account_id", accountId).gt("step_index", 0).in("wa_jid", jids)));
+  for (const lead of found.values()) {
+    const wantsOut = STOP_RE.test(text);
+    if (!lead.repliedAt && (lead.status === "in_progress" || lead.status === "completed")) {
+      await recordReply(lead, accountId, at, text, wantsOut);
+    } else if (lead.repliedAt) {
+      // They already replied before: keep the conversation going in the inbox.
+      pushEvent({ type: "reply", campaignId: lead.campaignId, accountId, leadId: lead.id, email: leadLabel(lead), detail: text.slice(0, 300) });
+      if (wantsOut && lead.status !== "unsubscribed") {
+        lead.status = "unsubscribed";
+        await addUnsubscribe(contactKey(lead), "reply", lead);
+      }
+    } else continue;
+    // Inbox bookkeeping (newest message time) lives outside the lead object.
+    await sb().from("leads").update({ last_reply_at: Math.round(at) }).eq("id", lead.id);
+  }
 }

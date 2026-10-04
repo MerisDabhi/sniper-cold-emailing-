@@ -28,7 +28,8 @@ export async function GET(req: NextRequest) {
     if (!(await acquireLease("email", 90, "vercel-cron"))) {
       return NextResponse.json({ ok: true, skipped: "another worker is sending email" });
     }
-    const replyCheck = new Date().getUTCMinutes() % 3 === 0;
+    // Email replies are checked by the Supabase `check-replies` job; only here if that is turned off.
+    const replyCheck = process.env.LOCAL_REPLY_CHECK === "true" && new Date().getUTCMinutes() % 3 === 0;
     await runEmailSender({ replyCheck, replyLimit: 10 });
     return NextResponse.json({ ok: true, replyCheck, ms: Date.now() - started });
   } catch (err) {

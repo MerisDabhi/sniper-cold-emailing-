@@ -4,15 +4,21 @@ import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useTheme } from "next-themes";
 import { useEffect, useState } from "react";
-import { BarChart3, ChevronsUpDown, LogOut, Mail, Menu, Monitor, Moon, Send, Settings, Sun, X } from "lucide-react";
-import { api } from "@/lib/client";
+import { BarChart3, ChevronsUpDown, Inbox, LogOut, Mail, Menu, Monitor, Moon, Send, Settings, Sun, X } from "lucide-react";
+import { api, pollWhileVisible } from "@/lib/client";
 import { Avatar, cn } from "./ui";
 import { WhatsAppGlyph } from "./Channel";
 
 type NavItem = { href: string; label: string; icon: React.ComponentType<{ className?: string }>; tone?: "wa" };
 const NAV: { title?: string; items: NavItem[] }[] = [
   { items: [{ href: "/dashboard", label: "Analytics", icon: BarChart3 }] },
-  { title: "Outreach", items: [{ href: "/campaigns", label: "Campaigns", icon: Send }] },
+  {
+    title: "Outreach",
+    items: [
+      { href: "/campaigns", label: "Campaigns", icon: Send },
+      { href: "/inbox", label: "Inbox", icon: Inbox },
+    ],
+  },
   {
     title: "Senders",
     items: [
@@ -28,12 +34,8 @@ type Me = { owner: { email: string; name: string; picture?: string } | null };
 export function Logo() {
   return (
     <div className="flex items-center gap-2.5">
-      <svg viewBox="0 0 32 32" className="size-7">
-        <rect width="32" height="32" rx="8" fill="var(--primary)" />
-        <circle cx="16" cy="16" r="8" fill="none" stroke="#fff" strokeWidth="2.2" />
-        <circle cx="16" cy="16" r="2.4" fill="#fff" />
-        <path d="M16 4v5M16 23v5M4 16h5M23 16h5" stroke="#fff" strokeWidth="2.2" strokeLinecap="round" />
-      </svg>
+      {/* eslint-disable-next-line @next/next/no-img-element */}
+      <img src="/logo.png" alt="" width={28} height={28} className="size-7 rounded-lg" />
       <span className="text-[15px] font-semibold tracking-tight">Sniper</span>
     </div>
   );
@@ -78,6 +80,16 @@ export function Shell({ children }: { children: React.ReactNode }) {
     api<Me>("/api/me").then(setMe).catch(() => {});
   }, []);
   useEffect(() => setOpen(false), [pathname]);
+  // Unread replies badge on "Inbox", kept fresh while the tab is visible.
+  const [unread, setUnread] = useState(0);
+  useEffect(() => {
+    const load = () =>
+      api<{ unread: number }>("/api/inbox/unread")
+        .then((r) => setUnread(r.unread))
+        .catch(() => {});
+    load();
+    return pollWhileVisible(load, 15000);
+  }, [pathname]);
 
   async function logout() {
     await api("/api/auth/logout", { method: "POST" });
@@ -110,6 +122,9 @@ export function Shell({ children }: { children: React.ReactNode }) {
                 >
                   <Icon className={cn("size-[18px]", active ? (wa ? "text-wa" : "text-primary") : "text-faint group-hover:text-text")} />
                   {label}
+                  {href === "/inbox" && unread > 0 && (
+                    <span className="ml-auto rounded-full bg-primary px-1.5 py-px text-[11px] font-semibold text-white tabular-nums">{unread > 99 ? "99+" : unread}</span>
+                  )}
                 </Link>
               );
             })}

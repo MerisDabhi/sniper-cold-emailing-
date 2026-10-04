@@ -155,7 +155,7 @@ export type Lead = {
   token: string;
 };
 
-export type EventType = "sent" | "reply" | "open" | "bounce" | "unsubscribe" | "error" | "duplicate";
+export type EventType = "sent" | "reply" | "open" | "bounce" | "unsubscribe" | "error" | "duplicate" | "manual";
 
 export type AppEvent = {
   id: string;

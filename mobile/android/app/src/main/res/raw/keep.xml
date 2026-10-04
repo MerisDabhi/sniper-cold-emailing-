@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Resources used only by name from Dart (notifications) — stop the release shrinker removing them. -->
+<resources xmlns:tools="http://schemas.android.com/tools"
+    tools:keep="@drawable/ic_stat_sniper,@drawable/ic_launcher_foreground,@mipmap/ic_launcher" />

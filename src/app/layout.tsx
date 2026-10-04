@@ -8,7 +8,7 @@ const inter = Inter({ subsets: ["latin"], variable: "--font-inter" });
 export const metadata: Metadata = {
   title: "Sniper — Cold Outreach",
   description: "Personal cold email outreach across your Gmail inboxes",
-  icons: { icon: "/icon.svg" },
+  icons: { icon: [{ url: "/favicon.ico" }, { url: "/logo.png", type: "image/png", sizes: "192x192" }], apple: "/apple-icon.png" },
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
